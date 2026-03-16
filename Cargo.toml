@@ -1,0 +1,7 @@
+[workspace]
+members = ["maokai-runner", "maokai-tree"]
+resolver = "3"
+
+[workspace.dependencies]
+maokai-tree = { path = "maokai-tree" }
+maokai-runner = { path = "maokai-runner" }
