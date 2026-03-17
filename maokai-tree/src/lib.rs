@@ -4,103 +4,101 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use indextree::Arena;
-pub use indextree::NodeId;
+use indextree::NodeId;
 
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
-pub struct State(pub(crate) Vec<NodeId>);
-
-impl State {
-    pub fn depth(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn leaf(&self) -> NodeId {
-        self.0
-            .last()
-            .cloned()
-            .expect("State must have at least one node")
-    }
-
-    pub fn to_path(&self) -> Vec<NodeId> {
-        self.0.clone()
-    }
-}
+pub struct State(pub(crate) NodeId);
 
 #[derive(Debug, Clone)]
 pub struct StateTree<T> {
     arena: Arena<T>,
-    root: NodeId,
+    root: State,
 }
 
 impl<T> StateTree<T> {
-    /// 创建一棵树，必须指定一个根
     pub fn new(root_data: T) -> Self {
         let mut arena = Arena::new();
         let root = arena.new_node(root_data);
-        Self { arena, root }
+        Self {
+            arena,
+            root: State(root),
+        }
     }
 
-    /// 插入子节点：业务层通过此接口扩展拓扑
-    pub fn add_child(&mut self, parent: NodeId, data: T) -> NodeId {
+    pub fn add_child(&mut self, parent: &State, data: T) -> State {
         let child = self.arena.new_node(data);
-        parent.append(child, &mut self.arena);
-        child
+        parent.0.append(child, &mut self.arena);
+        State(child)
     }
 
-    /// 获取根节点 ID
-    pub fn root(&self) -> NodeId {
-        self.root
+    pub fn root(&self) -> &State {
+        &self.root
     }
-    pub fn propose_transition(
-        &self,
-        current: &State,
-        target: &State,
-    ) -> (Vec<NodeId>, Vec<NodeId>) {
-        // 1. 溯源目标路径：[root, ..., target]
-        let mut target_path: Vec<NodeId> = target.to_path();
-        target_path.reverse();
 
-        // 2. 寻找 LCA (最小公共祖先)
-        let mut common_count = 0;
-        for (n1, n2) in current.0.iter().zip(target_path.iter()) {
-            if n1 == n2 {
-                common_count += 1;
-            } else {
-                break;
-            }
+    /// 计算从 current 到 target 的转移路径。
+    ///
+    /// 返回 (exit_list, enter_list)：
+    /// - exit_list: 需要 on_exit 的状态列表，顺序为 current -> LCA（不含 LCA）
+    /// - enter_list: 需要 on_enter 的状态列表，顺序为 LCA -> target（不含 LCA）
+    ///
+    /// 自转移（current == target）：返回 ([current], [target])，
+    /// 确保 on_exit + on_enter 都被触发。
+    pub fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
+        // 自转移特殊处理：exit 再 enter 自身
+        if current == target {
+            return (alloc::vec![current.clone()], alloc::vec![target.clone()]);
         }
 
-        // Exit：从当前路径的末尾向上到 LCA 之前
-        let exit_list = current.0[common_count..].iter().rev().cloned().collect();
+        let current_path = self.path_rev(current);
+        let target_path = self.path_rev(target);
 
-        // Enter：从目标路径的 LCA 之后向下到 target
-        let enter_list = target_path[common_count..].iter().cloned().collect();
+        debug_assert!(
+            current_path.last() == Some(&self.root.0) && target_path.last() == Some(&self.root.0),
+            "State nodes must belong to the same StateTree root!",
+        );
+
+        let mut i = current_path.len();
+        let mut j = target_path.len();
+
+        // 从 root 端向内收缩，找到 LCA
+        while i > 0 && j > 0 && current_path[i - 1] == target_path[j - 1] {
+            i -= 1;
+            j -= 1;
+        }
+
+        // exit_list: current 到 LCA（不含 LCA），顺序 current -> LCA 方向
+        let exit_list: Vec<State> = current_path[..i].iter().copied().map(State).collect();
+
+        // enter_list: LCA 到 target（不含 LCA），顺序 LCA -> target 方向
+        let mut enter_list: Vec<State> = target_path[..j].iter().copied().map(State).collect();
+        enter_list.reverse();
 
         (exit_list, enter_list)
     }
 
-    pub fn path_to(&self, node: &NodeId) -> Vec<NodeId> {
-        node.ancestors(&self.arena)
-            .collect::<Vec<_>>()
+    /// 返回 [state, ..., root] 路径（包含 state 自身）
+    pub fn path_rev(&self, state: &State) -> Vec<NodeId> {
+        state.0.ancestors(&self.arena).collect::<Vec<_>>()
+    }
+
+    /// root -> state 数据迭代器
+    pub fn travel<'a>(&'a self, state: &'a State) -> impl Iterator<Item = &'a T> {
+        self.path_rev(state)
             .into_iter()
             .rev()
-            .collect()
+            .filter_map(move |id| self.arena.get(id).map(|n| n.get()))
     }
 
-    pub fn state_of(&self, node: &NodeId) -> State {
-        State(self.path_to(node))
+    pub fn contains(&self, state: &State) -> bool {
+        self.arena.get(state.0).is_some()
     }
 
-    /// 向下巡游 (Downwards Travel)：从 Root 到 Leaf。
-    pub fn travel<'a>(&'a self, state: &'a State) -> impl DoubleEndedIterator<Item = &'a T> {
-        state
-            .0
-            .iter()
-            .filter_map(|&id| self.arena.get(id))
-            .map(|n| n.get())
+    pub fn parent_of(&self, state: &State) -> Option<State> {
+        // ancestors() 第 0 个是自身，第 1 个是 parent
+        state.0.ancestors(&self.arena).nth(1).map(State)
     }
 
-    pub fn get_node(&self, id: NodeId) -> Option<&T> {
-        self.arena.get(id).map(|n| n.get())
+    pub fn children_of(&self, state: &State) -> Vec<State> {
+        state.0.children(&self.arena).map(State).collect()
     }
 }
