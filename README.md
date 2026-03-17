@@ -18,7 +18,8 @@ A compile-time state machine is a program. A runtime state tree is data.
 Declarative state machine libraries — whether type-based like [statig](https://github.com/mdeloof/statig) or DSL-based
 like [banish](https://github.com/LoganFlaherty/banish) — fix topology at compile time. When topology is data, it can be
 loaded from a file, assembled from user input, or shared across a thousand instances without copying. The cost is that
-errors surface at runtime rather than compile time. That tradeoff is the reason to choose maokai or not.
+errors surface at runtime rather than compile time, and performance is strictly worse than a compile-time solution. If a
+declarative library solves your problem, use that instead.
 
 ---
 
