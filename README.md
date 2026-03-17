@@ -34,7 +34,7 @@ own `Behaviors`. No coordination required.
 
 ## RTC dispatch
 
-Dispatch is event-driven and follows Run-To-Completion semantics. Each event is fully processed before the next can be dispatched. The entire exit and enter sequence completes before `dispatch` returns.
+Dispatch is `event-driven` and follows `Run-To-Completion` semantics. Each event is fully processed before the next can be dispatched. The entire exit and enter sequence completes before `dispatch` returns.
 
 `dispatch` is not `re-entrant`. Calling `dispatch` from within `on_event`, `on_exit`, or `on_enter` is undefined behavior. This is a usage contract, not a type-level guarantee.
 
