@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::any::Any;
 use indextree::Arena;
 use indextree::NodeId;
 
@@ -31,20 +32,20 @@ impl<T> StateTree<T> {
         State(child)
     }
 
-    pub fn root(&self) -> &State {
-        &self.root
+    pub fn root(&self) -> State {
+        self.root.clone()
     }
 
-    /// 计算从 current 到 target 的转移路径。
+    /// Calculates the transition path from current to target.
     ///
-    /// 返回 (exit_list, enter_list)：
-    /// - exit_list: 需要 on_exit 的状态列表，顺序为 current -> LCA（不含 LCA）
-    /// - enter_list: 需要 on_enter 的状态列表，顺序为 LCA -> target（不含 LCA）
+    /// Returns (exit_list, enter_list):
+    /// - `exit_list`: list of states that need on_exit, in order current -> LCA (excluding LCA)
+    /// - `enter_list`: list of states that need on_enter, in order LCA -> target (excluding LCA)
     ///
-    /// 自转移（current == target）：返回 ([current], [target])，
-    /// 确保 on_exit + on_enter 都被触发。
+    /// Self-transition (current == target): returns ([current], [target]),
+    /// ensuring both on_exit + on_enter are triggered.
     pub fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
-        // 自转移特殊处理：exit 再 enter 自身
+        // Special handling for self-transition: exit then enter self
         if current == target {
             return (alloc::vec![current.clone()], alloc::vec![target.clone()]);
         }
@@ -60,28 +61,28 @@ impl<T> StateTree<T> {
         let mut i = current_path.len();
         let mut j = target_path.len();
 
-        // 从 root 端向内收缩，找到 LCA
+        // Contract from root side to find LCA
         while i > 0 && j > 0 && current_path[i - 1] == target_path[j - 1] {
             i -= 1;
             j -= 1;
         }
 
-        // exit_list: current 到 LCA（不含 LCA），顺序 current -> LCA 方向
+        // exit_list: current to LCA (excluding LCA), in current -> LCA direction
         let exit_list: Vec<State> = current_path[..i].iter().copied().map(State).collect();
 
-        // enter_list: LCA 到 target（不含 LCA），顺序 LCA -> target 方向
+        // enter_list: LCA to target (excluding LCA), in LCA -> target direction
         let mut enter_list: Vec<State> = target_path[..j].iter().copied().map(State).collect();
         enter_list.reverse();
 
         (exit_list, enter_list)
     }
 
-    /// 返回 [state, ..., root] 路径（包含 state 自身）
+    /// Returns [state, ..., root] path (including state itself)
     pub fn path_rev(&self, state: &State) -> Vec<NodeId> {
         state.0.ancestors(&self.arena).collect::<Vec<_>>()
     }
 
-    /// root -> state 数据迭代器
+    /// Data iterator from root -> state
     pub fn travel<'a>(&'a self, state: &'a State) -> impl Iterator<Item = &'a T> {
         self.path_rev(state)
             .into_iter()
@@ -94,11 +95,24 @@ impl<T> StateTree<T> {
     }
 
     pub fn parent_of(&self, state: &State) -> Option<State> {
-        // ancestors() 第 0 个是自身，第 1 个是 parent
         state.0.ancestors(&self.arena).nth(1).map(State)
     }
 
     pub fn children_of(&self, state: &State) -> Vec<State> {
         state.0.children(&self.arena).map(State).collect()
+    }
+}
+
+impl<T: Any + PartialEq> StateTree<T> {
+    pub fn find(&self, data: &dyn Any) -> Option<State> {
+        self.arena
+            .iter()
+            .find(|node| match data.downcast_ref::<T>() {
+                Some(target) => node.get() == target,
+                None => false,
+            })
+            .map(|node| self.arena.get_node_id(node))
+            .flatten()
+            .map(State)
     }
 }
