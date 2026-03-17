@@ -120,11 +120,11 @@ mod tests {
 
     extern crate alloc;
 
+    use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::cell::RefCell;
-
-    use super::*;
+    use maokai_tree::{TreeLookup, lookup};
 
     // -------------------------------------------------------------
     // State definition (enum)
@@ -186,7 +186,7 @@ mod tests {
         ) -> EventReply {
             match event {
                 Event::Toggle => {
-                    let target = tree.lookup(&BlinkyState::On).unwrap();
+                    let target = lookup!(tree, BlinkyState::On).unwrap();
                     EventReply::Transition(target)
                 }
             }
@@ -217,7 +217,7 @@ mod tests {
         ) -> EventReply {
             match event {
                 Event::Toggle => {
-                    let target = tree.lookup(&BlinkyState::Off).unwrap();
+                    let target = lookup!(tree, BlinkyState::Off).unwrap();
                     EventReply::Transition(target)
                 }
             }
@@ -236,8 +236,8 @@ mod tests {
         let on = tree.add_child(&tree.root(), BlinkyState::On);
 
         // lookup verification
-        let off_state = tree.lookup(&BlinkyState::Off).unwrap();
-        let on_state = tree.lookup(&BlinkyState::On).unwrap();
+        let off_state = lookup!(tree, BlinkyState::Off).unwrap();
+        let on_state = lookup!(tree, BlinkyState::On).unwrap();
 
         assert_eq!(off, off_state);
         assert_eq!(on, on_state);
@@ -275,7 +275,7 @@ mod tests {
         let mut tree = StateTree::new(BlinkyState::Root);
         let _off = tree.add_child(&tree.root(), BlinkyState::Off);
 
-        let off_state = tree.lookup(&BlinkyState::Off).unwrap();
+        let off_state = lookup!(tree, BlinkyState::Off).unwrap();
 
         assert_eq!(off_state, _off);
 

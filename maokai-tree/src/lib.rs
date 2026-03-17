@@ -108,24 +108,142 @@ impl<T> StateTree<T> {
 }
 
 impl<T: Any + PartialEq> StateTree<T> {
-    pub fn find(&self, data: &dyn Any) -> Option<State> {
-        self.arena
-            .iter()
-            .find(|node| match data.downcast_ref::<T>() {
-                Some(target) => node.get() == target,
-                None => false,
-            })
-            .and_then(|node| self.arena.get_node_id(node))
-            .map(State)
+    pub fn query(&self, dataset: &[&dyn Any]) -> Option<State> {
+        debug_assert!(dataset.len() <= 64, "dataset length must be <= 64");
+
+        fn dfs<T: Any + PartialEq>(
+            arena: &Arena<T>,
+            node: NodeId,
+            dataset: &[&dyn Any],
+            mut unmatched: u64,
+        ) -> Option<NodeId> {
+            for (i, d) in dataset.iter().enumerate() {
+                if unmatched & (1 << i) != 0
+                    && d.downcast_ref::<T>()
+                        .is_some_and(|t| t == arena[node].get())
+                {
+                    unmatched ^= 1 << i;
+                    break;
+                }
+            }
+
+            if unmatched == 0 {
+                return Some(node);
+            }
+
+            node.children(arena)
+                .find_map(|c| dfs(arena, c, dataset, unmatched))
+        }
+
+        let unmatched = (1u64 << dataset.len()) - 1;
+
+        dfs(&self.arena, self.root.0, dataset, unmatched).map(State)
     }
 }
 
 pub trait TreeLookup {
-    fn lookup(&self, data: &dyn Any) -> Option<State>;
+    fn lookup(&self, dataset: &[&dyn Any]) -> Option<State>;
 }
 
 impl<T: Any + PartialEq> TreeLookup for StateTree<T> {
-    fn lookup(&self, data: &dyn Any) -> Option<State> {
-        self.find(data)
+    fn lookup(&self, dataset: &[&dyn Any]) -> Option<State> {
+        self.query(dataset)
+    }
+}
+
+#[macro_export]
+macro_rules! lookup {
+    ($tree:expr, $($data:expr),+) => {
+        $tree.lookup(&[$(&$data),+])
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum S {
+        Root,
+        A,
+        B,
+        C,
+        D,
+    }
+
+    /// ```text
+    /// Root
+    /// ├── A
+    /// │   ├── B  (leaf)
+    /// │   └── C  (leaf)
+    /// └── D  (leaf)
+    /// ```
+    fn build_tree() -> (StateTree<S>, State, State, State, State) {
+        let mut tree = StateTree::new(S::Root);
+        let a = tree.add_child(&tree.root(), S::A);
+        let b = tree.add_child(&a, S::B);
+        let c = tree.add_child(&a, S::C);
+        let d = tree.add_child(&tree.root(), S::D);
+        (tree, a, b, c, d)
+    }
+
+    #[test]
+    fn match_root() {
+        let (tree, _, _, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::Root), Some(tree.root()));
+    }
+
+    #[test]
+    fn match_non_leaf() {
+        let (tree, a, _, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::A), Some(a));
+    }
+
+    #[test]
+    fn match_leaf() {
+        let (tree, _, b, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::B), Some(b));
+    }
+
+    #[test]
+    fn match_deepest_ordered() {
+        let (tree, _, b, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::A, S::B), Some(b));
+    }
+
+    #[test]
+    fn match_deepest_unordered() {
+        let (tree, _, b, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::B, S::A), Some(b));
+    }
+
+    #[test]
+    fn match_sibling() {
+        let (tree, _, _, c, _) = build_tree();
+        assert_eq!(lookup!(tree, S::A, S::C), Some(c));
+    }
+
+    #[test]
+    fn match_root_to_leaf() {
+        let (tree, _, b, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::Root, S::A, S::B), Some(b));
+    }
+
+    #[test]
+    fn no_match_across_branches() {
+        let (tree, _, _, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::B, S::D), None);
+    }
+
+    #[test]
+    fn no_match_sibling_leaves() {
+        let (tree, _, _, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::B, S::C), None);
+    }
+
+    #[test]
+    fn no_match_unknown() {
+        let (tree, _, _, _, _) = build_tree();
+        assert_eq!(lookup!(tree, S::D, S::B), None);
     }
 }
