@@ -101,6 +101,10 @@ impl<T> StateTree<T> {
     pub fn children_of(&self, state: &State) -> Vec<State> {
         state.0.children(&self.arena).map(State).collect()
     }
+
+    pub fn kind(&self, state: &State) -> Option<&T> {
+        self.arena.get(state.0).map(|node| node.get())
+    }
 }
 
 impl<T: Any + PartialEq> StateTree<T> {
@@ -111,8 +115,17 @@ impl<T: Any + PartialEq> StateTree<T> {
                 Some(target) => node.get() == target,
                 None => false,
             })
-            .map(|node| self.arena.get_node_id(node))
-            .flatten()
+            .and_then(|node| self.arena.get_node_id(node))
             .map(State)
+    }
+}
+
+pub trait TreeLookup {
+    fn lookup(&self, data: &dyn Any) -> Option<State>;
+}
+
+impl<T: Any + PartialEq> TreeLookup for StateTree<T> {
+    fn lookup(&self, data: &dyn Any) -> Option<State> {
+        self.find(data)
     }
 }

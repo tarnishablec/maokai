@@ -5,3 +5,6 @@ resolver = "3"
 [workspace.dependencies]
 maokai-tree = { path = "maokai-tree" }
 maokai-runner = { path = "maokai-runner" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

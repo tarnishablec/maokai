@@ -3,8 +3,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use core::any::Any;
-use maokai_tree::{State, StateTree};
+use maokai_tree::{State, StateTree, TreeLookup};
 
 // -- Public Types ------------------------------------------------------------------
 
@@ -23,29 +22,21 @@ pub trait Behavior<E> {
     fn on_event(&mut self, event: &E, current: &State, tree: &dyn TreeLookup) -> EventReply;
 }
 
-pub trait TreeLookup {
-    fn lookup(&self, data: &dyn Any) -> Option<State>;
-}
-
-impl<T: Any + PartialEq> TreeLookup for StateTree<T> {
-    fn lookup(&self, data: &dyn Any) -> Option<State> {
-        self.find(data)
-    }
-}
-
 // -- Behaviors: External behavior registry (owned by caller) ------------------
 
 pub struct Behaviors<'a, E> {
     map: BTreeMap<State, Box<dyn Behavior<E> + 'a>>,
 }
 
-impl<'a, E> Behaviors<'a, E> {
-    pub fn new() -> Self {
+impl<E> Default for Behaviors<'_, E> {
+    fn default() -> Self {
         Self {
             map: BTreeMap::new(),
         }
     }
+}
 
+impl<'a, E> Behaviors<'a, E> {
     pub fn register(&mut self, state: &State, behaviour: impl Behavior<E> + 'a) {
         self.map.insert(state.clone(), Box::new(behaviour));
     }
@@ -125,6 +116,8 @@ impl<'a, T: PartialEq + 'static> Runner<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     extern crate alloc;
 
     use alloc::vec;
@@ -239,8 +232,8 @@ mod tests {
         // Build tree
         let mut tree = StateTree::new(BlinkyState::Root);
 
-        let off = tree.add_child(&tree.root().clone(), BlinkyState::Off);
-        let on = tree.add_child(&tree.root().clone(), BlinkyState::On);
+        let off = tree.add_child(&tree.root(), BlinkyState::Off);
+        let on = tree.add_child(&tree.root(), BlinkyState::On);
 
         // lookup verification
         let off_state = tree.lookup(&BlinkyState::Off).unwrap();
@@ -252,7 +245,7 @@ mod tests {
         // Behavior registration
         let log = Log::default();
 
-        let mut behaviours = Behaviors::new();
+        let mut behaviours = Behaviors::default();
         behaviours.register(&off_state, OffBehaviour { log: &log });
         behaviours.register(&on_state, OnBehaviour { log: &log });
 
@@ -284,6 +277,8 @@ mod tests {
 
         let off_state = tree.lookup(&BlinkyState::Off).unwrap();
 
+        assert_eq!(off_state, _off);
+
         let log = Log::default();
 
         struct RealSelfBehaviour<'a> {
@@ -305,7 +300,7 @@ mod tests {
             }
         }
 
-        let mut behaviours = Behaviors::new();
+        let mut behaviours = Behaviors::default();
         behaviours.register(
             &off_state,
             RealSelfBehaviour {
@@ -318,6 +313,8 @@ mod tests {
 
         let current = off_state.clone();
         let current = runner.dispatch(&mut behaviours, &current, &Event::Toggle);
+
+        assert_eq!(*tree.kind(&current).unwrap(), BlinkyState::Off);
 
         assert_eq!(current, off_state);
         assert_eq!(log.take(), vec!["exit", "enter"]);
