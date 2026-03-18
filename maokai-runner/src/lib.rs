@@ -17,9 +17,9 @@ pub enum EventReply {
 }
 
 pub trait Behavior<E> {
-    fn on_enter(&mut self, _current: &State) {}
-    fn on_exit(&mut self, _current: &State) {}
-    fn on_event(&mut self, event: &E, current: &State, tree: &dyn TreeLookup) -> EventReply;
+    fn on_enter(&self, _current: &State) {}
+    fn on_exit(&self, _current: &State) {}
+    fn on_event(&self, event: &E, current: &State, tree: &dyn TreeLookup) -> EventReply;
 }
 
 // -- Behaviors: External behavior registry (owned by caller) ------------------
@@ -59,7 +59,7 @@ impl<'a, T: PartialEq + 'static> Runner<'a, T> {
     /// - Returns the final state after transition
     ///
     /// Note: no re-entrant. `dispatch` should not be called within on_event / on_exit / on_enter.
-    pub fn dispatch<E>(&self, behaviours: &mut Behaviors<E>, current: &State, event: &E) -> State {
+    pub fn dispatch<E>(&self, behaviours: &Behaviors<E>, current: &State, event: &E) -> State {
         match self.bubble(behaviours, current, event) {
             EventReply::Transition(target) => {
                 self.transition(behaviours, current, &target);
@@ -72,20 +72,20 @@ impl<'a, T: PartialEq + 'static> Runner<'a, T> {
     /// Executes transition sequence: exit_list calls on_exit, enter_list calls on_enter sequentially
     pub fn transition<E>(
         &self,
-        behaviours: &mut Behaviors<E>,
+        behaviours: &Behaviors<E>,
         current: &State,
         target: &State,
     ) -> State {
         let (exit_list, enter_list) = self.tree.propose_transition(current, target);
 
         for state in &exit_list {
-            if let Some(b) = behaviours.map.get_mut(state) {
+            if let Some(b) = behaviours.map.get(state) {
                 b.on_exit(current);
             }
         }
 
         for state in &enter_list {
-            if let Some(b) = behaviours.map.get_mut(state) {
+            if let Some(b) = behaviours.map.get(state) {
                 b.on_enter(current);
             }
         }
@@ -96,11 +96,11 @@ impl<'a, T: PartialEq + 'static> Runner<'a, T> {
     // -- Private Implementation --------------------------------------------------
 
     /// Bubbles up to ancestors, skips nodes without registered behavior, until root
-    fn bubble<E>(&self, behaviours: &mut Behaviors<E>, current: &State, event: &E) -> EventReply {
+    fn bubble<E>(&self, behaviours: &Behaviors<E>, current: &State, event: &E) -> EventReply {
         let mut probe = current.clone();
 
         loop {
-            if let Some(b) = behaviours.map.get_mut(&probe) {
+            if let Some(b) = behaviours.map.get(&probe) {
                 match b.on_event(event, current, self.tree) {
                     EventReply::Ignored => {}
                     other => return other, // Handled or Transition
@@ -170,16 +170,16 @@ mod tests {
     }
 
     impl<'a> Behavior<Event> for OffBehaviour<'a> {
-        fn on_enter(&mut self, _current: &State) {
+        fn on_enter(&self, _current: &State) {
             self.log.push("enter_off");
         }
 
-        fn on_exit(&mut self, _current: &State) {
+        fn on_exit(&self, _current: &State) {
             self.log.push("exit_off");
         }
 
         fn on_event(
-            &mut self,
+            &self,
             event: &Event,
             _current: &State,
             tree: &dyn TreeLookup,
@@ -201,16 +201,16 @@ mod tests {
     }
 
     impl<'a> Behavior<Event> for OnBehaviour<'a> {
-        fn on_enter(&mut self, _current: &State) {
+        fn on_enter(&self, _current: &State) {
             self.log.push("enter_on");
         }
 
-        fn on_exit(&mut self, _current: &State) {
+        fn on_exit(&self, _current: &State) {
             self.log.push("exit_on");
         }
 
         fn on_event(
-            &mut self,
+            &self,
             event: &Event,
             _current: &State,
             tree: &dyn TreeLookup,
@@ -255,13 +255,13 @@ mod tests {
         let mut current = off_state.clone();
 
         // -- First Toggle: Off -> On --
-        current = runner.dispatch(&mut behaviours, &current, &Event::Toggle);
+        current = runner.dispatch(&behaviours, &current, &Event::Toggle);
 
         assert_eq!(current, on_state);
         assert_eq!(log.take(), vec!["exit_off", "enter_on"]);
 
         // -- Second Toggle: On -> Off --
-        current = runner.dispatch(&mut behaviours, &current, &Event::Toggle);
+        current = runner.dispatch(&behaviours, &current, &Event::Toggle);
 
         assert_eq!(current, off_state);
         assert_eq!(log.take(), vec!["exit_on", "enter_off"]);
@@ -287,15 +287,15 @@ mod tests {
         }
 
         impl<'a> Behavior<Event> for RealSelfBehaviour<'a> {
-            fn on_enter(&mut self, _current: &State) {
+            fn on_enter(&self, _current: &State) {
                 self.log.push("enter");
             }
 
-            fn on_exit(&mut self, _current: &State) {
+            fn on_exit(&self, _current: &State) {
                 self.log.push("exit");
             }
 
-            fn on_event(&mut self, _: &Event, _current: &State, _: &dyn TreeLookup) -> EventReply {
+            fn on_event(&self, _: &Event, _current: &State, _: &dyn TreeLookup) -> EventReply {
                 EventReply::Transition(self.me.clone())
             }
         }
@@ -312,7 +312,7 @@ mod tests {
         let runner = Runner::new(&tree);
 
         let current = off_state.clone();
-        let current = runner.dispatch(&mut behaviours, &current, &Event::Toggle);
+        let current = runner.dispatch(&behaviours, &current, &Event::Toggle);
 
         assert_eq!(*tree.kind(&current).unwrap(), BlinkyState::Off);
 
