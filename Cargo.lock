@@ -10,14 +10,14 @@ checksum = "cb9e21e48c85fa6643a38caca564645a3bbc9211edf506fc8ed690c7e7b4d3c7"
 
 [[package]]
 name = "maokai-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "maokai-tree",
 ]
 
 [[package]]
 name = "maokai-tree"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "indextree",
 ]
