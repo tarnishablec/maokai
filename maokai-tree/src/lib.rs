@@ -117,14 +117,10 @@ pub trait TreeView {
     fn lookup(&self, dataset: &[&dyn Any]) -> Option<State>;
 }
 
-#[cfg(not(feature = "lookup"))]
-impl<T> TreeView for StateTree<T> {}
-
-#[cfg(feature = "lookup")]
 use core::any::Any;
 
-#[cfg(feature = "lookup")]
 impl<T: Any + PartialEq> TreeView for StateTree<T> {
+    #[cfg(feature = "lookup")]
     fn lookup(&self, dataset: &[&dyn Any]) -> Option<State> {
         debug_assert!(dataset.len() <= 64, "dataset length must be <= 64");
 
