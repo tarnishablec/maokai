@@ -35,15 +35,25 @@ impl<T> StateTree<T> {
         }
     }
 
+    pub fn path_rev_iter(&self, state: &State) -> impl Iterator<Item = NodeId> {
+        state.0.ancestors(&self.arena)
+    }
+
     pub fn add_child(&mut self, parent: &State, data: T) -> State {
         let child = self.arena.new_node(data);
         parent.0.append(child, &mut self.arena);
         State(child)
     }
+}
 
-    pub fn root(&self) -> State {
-        self.root.clone()
-    }
+pub trait TreeView {
+    fn contains(&self, state: &State) -> bool;
+    fn parent_of(&self, state: &State) -> Option<State>;
+    fn children_of(&self, state: &State) -> Vec<State>;
+
+    fn root(&self) -> State;
+
+    fn depth(&self, state: &State) -> usize;
 
     /// Calculates the transition path from current to target.
     ///
@@ -53,13 +63,35 @@ impl<T> StateTree<T> {
     /// - `enter_list`: states to call `on_enter`, ordered `LCA -> target` (excluding LCA)
     ///
     /// Self-transition (`current == target`) returns `([current], [target])`.
-    pub fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
+    fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>);
+}
+
+impl<T> TreeView for StateTree<T> {
+    fn contains(&self, state: &State) -> bool {
+        self.arena.get(state.0).is_some()
+    }
+
+    fn parent_of(&self, state: &State) -> Option<State> {
+        state.0.ancestors(&self.arena).nth(1).map(State)
+    }
+
+    fn children_of(&self, state: &State) -> Vec<State> {
+        state.0.children(&self.arena).map(State).collect()
+    }
+    fn root(&self) -> State {
+        self.root.clone()
+    }
+    fn depth(&self, state: &State) -> usize {
+        state.0.ancestors(&self.arena).count()
+    }
+
+    fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
         if current == target {
             return (alloc::vec![current.clone()], alloc::vec![target.clone()]);
         }
 
-        let current_path = self.path_rev(current);
-        let target_path = self.path_rev(target);
+        let current_path = self.path_rev_iter(current).collect::<Vec<_>>();
+        let target_path = self.path_rev_iter(target).collect::<Vec<_>>();
 
         debug_assert!(
             current_path.last() == Some(&self.root.0) && target_path.last() == Some(&self.root.0),
@@ -81,76 +113,75 @@ impl<T> StateTree<T> {
 
         (exit_list, enter_list)
     }
+}
 
-    /// Returns `[state, ..., root]` (including the state itself).
-    pub fn path_rev(&self, state: &State) -> Vec<NodeId> {
-        state.0.ancestors(&self.arena).collect::<Vec<_>>()
+pub trait DataView<T>: TreeView {
+    fn get_data(&self, state: &State) -> Option<&T>;
+
+    fn travel<'a>(&'a self, state: &'a State) -> impl Iterator<Item = &'a T> + 'a
+    where
+        T: 'a;
+}
+
+impl<T> DataView<T> for StateTree<T> {
+    fn get_data(&self, state: &State) -> Option<&T> {
+        self.arena.get(state.0).map(|node| node.get())
     }
 
     /// Iterates payload data from root to `state`.
-    pub fn travel<'a>(&'a self, state: &'a State) -> impl Iterator<Item = &'a T> {
-        self.path_rev(state)
-            .into_iter()
-            .rev()
+    fn travel<'a>(&'a self, state: &'a State) -> impl Iterator<Item = &'a T> + 'a
+    where
+        T: 'a,
+    {
+        let mut ids: Vec<NodeId> = self.path_rev_iter(state).collect();
+        ids.reverse();
+        ids.into_iter()
             .filter_map(move |id| self.arena.get(id).map(|n| n.get()))
     }
-
-    pub fn contains(&self, state: &State) -> bool {
-        self.arena.get(state.0).is_some()
-    }
-
-    pub fn parent_of(&self, state: &State) -> Option<State> {
-        state.0.ancestors(&self.arena).nth(1).map(State)
-    }
-
-    pub fn children_of(&self, state: &State) -> Vec<State> {
-        state.0.children(&self.arena).map(State).collect()
-    }
-
-    pub fn kind(&self, state: &State) -> Option<&T> {
-        self.arena.get(state.0).map(|node| node.get())
-    }
 }
 
-pub trait TreeView {
-    #[cfg(feature = "lookup")]
-    fn lookup(&self, dataset: &[&dyn Any]) -> Option<State>;
+pub trait Lookup<T> {
+    fn lookup(&self, dataset: &[&T]) -> Option<State>;
 }
 
-use core::any::Any;
-
-impl<T: Any + PartialEq> TreeView for StateTree<T> {
-    #[cfg(feature = "lookup")]
-    fn lookup(&self, dataset: &[&dyn Any]) -> Option<State> {
+#[cfg(feature = "lookup")]
+impl<T, U> Lookup<T> for U
+where
+    T: PartialEq,
+    U: DataView<T>,
+{
+    fn lookup(&self, dataset: &[&T]) -> Option<State> {
         debug_assert!(dataset.len() <= 64, "dataset length must be <= 64");
 
-        fn dfs<T: Any + PartialEq>(
-            arena: &Arena<T>,
-            node: NodeId,
-            dataset: &[&dyn Any],
+        fn dfs<T: PartialEq, V: DataView<T> + ?Sized>(
+            view: &V,
+            current: State,
+            dataset: &[&T],
             mut unmatched: u64,
-        ) -> Option<NodeId> {
-            for (i, data) in dataset.iter().enumerate() {
-                if unmatched & (1 << i) != 0
-                    && data
-                        .downcast_ref::<T>()
-                        .is_some_and(|kind| kind == arena[node].get())
-                {
-                    unmatched ^= 1 << i;
-                    break;
+        ) -> Option<State> {
+            if let Some(node_data) = view.get_data(&current) {
+                for (i, &target_data) in dataset.iter().enumerate() {
+                    if unmatched & (1 << i) != 0 && target_data == node_data {
+                        unmatched ^= 1 << i;
+                        break;
+                    }
                 }
             }
 
             if unmatched == 0 {
-                return Some(node);
+                return Some(current);
             }
 
-            node.children(arena)
-                .find_map(|child| dfs(arena, child, dataset, unmatched))
+            for child in view.children_of(&current) {
+                if let Some(found) = dfs(view, child, dataset, unmatched) {
+                    return Some(found);
+                }
+            }
+            None
         }
 
         let unmatched = (1u64 << dataset.len()) - 1;
-        dfs(&self.arena, self.root.0, dataset, unmatched).map(State)
+        dfs(self, self.root(), dataset, unmatched)
     }
 }
 
@@ -158,7 +189,7 @@ impl<T: Any + PartialEq> TreeView for StateTree<T> {
 #[macro_export]
 macro_rules! lookup {
     ($tree:expr, $($data:expr),+) => {
-        $crate::TreeView::lookup(&$tree, &[$(&$data),+])
+        $crate::Lookup::lookup(&$tree, &[$(&$data),+])
     };
 }
 
