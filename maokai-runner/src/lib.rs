@@ -49,7 +49,7 @@ impl<'a, E> Behaviors<'a, E> {
 
 /// The execution engine that manages state transitions and event bubbling.
 pub struct Runner<'a, T> {
-    tree: &'a StateTree<T>,
+    pub tree: &'a StateTree<T>,
 }
 
 impl<'a, T> Runner<'a, T> {
