@@ -3,6 +3,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use maokai_tree::{State, StateTree, TreeView};
 
 // --- Core Runner Logic ---
@@ -17,12 +18,22 @@ pub enum EventReply {
     Transition(State),
 }
 
+/// Describes a transition from one state to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub from: State,
+    pub target: State,
+    pub current: State,
+    pub exit_list: Vec<State>,
+    pub enter_list: Vec<State>,
+}
+
 /// Defines the life-cycle and event-handling logic for a specific state.
 pub trait Behavior<E>: Send + Sync {
     /// Called when the state machine enters this state.
-    fn on_enter(&self, _state: &State) {}
+    fn on_enter(&self, _transition: &Transition) {}
     /// Called when the state machine exits this state.
-    fn on_exit(&self, _state: &State) {}
+    fn on_exit(&self, _transition: &Transition) {}
     /// Processes an incoming event.
     fn on_event(&self, event: &E, current: &State, tree: &dyn TreeView) -> EventReply;
 }
@@ -66,18 +77,29 @@ impl<'a, T> Runner<'a, T> {
         target: &State,
     ) -> State {
         let (exit_list, enter_list) = self.tree.propose_transition(current, target);
+        let transition = Transition {
+            from: current.clone(),
+            target: target.clone(),
+            current: current.clone(),
+            exit_list,
+            enter_list,
+        };
 
         // Notify states being exited (from leaf towards LCA)
-        for state in &exit_list {
+        for state in &transition.exit_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                behavior.on_exit(state);
+                let mut step = transition.clone();
+                step.current = state.clone();
+                behavior.on_exit(&step);
             }
         }
 
         // Notify states being entered (from LCA towards target leaf)
-        for state in &enter_list {
+        for state in &transition.enter_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                behavior.on_enter(state);
+                let mut step = transition.clone();
+                step.current = state.clone();
+                behavior.on_enter(&step);
             }
         }
 
@@ -93,10 +115,7 @@ where
     /// Follows Run-to-Completion (RTC) semantics.
     pub fn dispatch<E>(&self, behaviors: &Behaviors<E>, current: &State, event: &E) -> State {
         match self.bubble(behaviors, current, event) {
-            EventReply::Transition(target) => {
-                self.transition(behaviors, current, &target);
-                target
-            }
+            EventReply::Transition(target) => self.transition(behaviors, current, &target),
             _ => current.clone(),
         }
     }
@@ -126,7 +145,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     extern crate std;
     use super::*;
-    use alloc::vec::Vec;
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,14 +162,14 @@ mod tests {
     /// Thread-safe log to track call sequences and the specific State handles passed.
     #[derive(Default)]
     struct Log {
-        entries: Mutex<Vec<(&'static str, State)>>,
+        entries: Mutex<Vec<(&'static str, Transition)>>,
     }
 
     impl Log {
-        fn push(&self, action: &'static str, state: &State) {
-            self.entries.lock().unwrap().push((action, state.clone()));
+        fn push(&self, action: &'static str, transition: &Transition) {
+            self.entries.lock().unwrap().push((action, transition.clone()));
         }
-        fn take(&self) -> Vec<(&'static str, State)> {
+        fn take(&self) -> Vec<(&'static str, Transition)> {
             core::mem::take(&mut *self.entries.lock().unwrap())
         }
     }
@@ -162,11 +180,11 @@ mod tests {
     }
 
     impl<'a> Behavior<Event> for BlinkyBehavior<'a> {
-        fn on_enter(&self, state: &State) {
-            self.log.push("enter", state);
+        fn on_enter(&self, transition: &Transition) {
+            self.log.push("enter", transition);
         }
-        fn on_exit(&self, state: &State) {
-            self.log.push("exit", state);
+        fn on_exit(&self, transition: &Transition) {
+            self.log.push("exit", transition);
         }
         fn on_event(&self, _e: &Event, _c: &State, _t: &dyn TreeView) -> EventReply {
             EventReply::Transition(self.target.clone())
@@ -203,16 +221,50 @@ mod tests {
         // 1. Dispatch Toggle while in the 'Off' state
         runner.dispatch(&behaviors, &off, &Event::Toggle);
         let results = log.take();
+        let expected = Transition {
+            from: off.clone(),
+            target: on.clone(),
+            current: off.clone(),
+            exit_list: alloc::vec![off.clone()],
+            enter_list: alloc::vec![on.clone()],
+        };
+        let expected_enter = Transition {
+            current: on.clone(),
+            ..expected.clone()
+        };
 
         // Verify that 'exit' received the 'off' handle and 'enter' received the 'on' handle
-        assert_eq!(results, [("exit", off.clone()), ("enter", on.clone())]);
+        assert_eq!(
+            results,
+            [
+                ("exit", expected.clone()),
+                ("enter", expected_enter),
+            ]
+        );
 
         // 2. Dispatch Toggle while in the 'On' state
         runner.dispatch(&behaviors, &on, &Event::Toggle);
         let results = log.take();
+        let expected = Transition {
+            from: on.clone(),
+            target: off.clone(),
+            current: on.clone(),
+            exit_list: alloc::vec![on.clone()],
+            enter_list: alloc::vec![off.clone()],
+        };
+        let expected_enter = Transition {
+            current: off.clone(),
+            ..expected.clone()
+        };
 
         // Verify reverse transition handles
-        assert_eq!(results, [("exit", on.clone()), ("enter", off.clone())]);
+        assert_eq!(
+            results,
+            [
+                ("exit", expected.clone()),
+                ("enter", expected_enter),
+            ]
+        );
     }
 
     #[test]
@@ -235,7 +287,20 @@ mod tests {
         runner.dispatch(&behaviors, &off, &Event::Toggle);
 
         let results = log.take();
+        let expected = Transition {
+            from: off.clone(),
+            target: off.clone(),
+            current: off.clone(),
+            exit_list: alloc::vec![off.clone()],
+            enter_list: alloc::vec![off.clone()],
+        };
         // In a self-transition, both exit and enter should receive the same state handle
-        assert_eq!(results, [("exit", off.clone()), ("enter", off.clone())]);
+        assert_eq!(
+            results,
+            [
+                ("exit", expected.clone()),
+                ("enter", expected),
+            ]
+        );
     }
 }
