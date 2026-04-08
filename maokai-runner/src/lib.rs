@@ -23,27 +23,32 @@ pub enum EventReply {
 pub struct Transition {
     pub from: State,
     pub target: State,
-    pub current: State,
     pub exit_list: Vec<State>,
     pub enter_list: Vec<State>,
 }
 
 /// Defines the life-cycle and event-handling logic for a specific state.
-pub trait Behavior<E>: Send + Sync {
+pub trait Behavior<E, Context = ()>: Send + Sync {
     /// Called when the state machine enters this state.
-    fn on_enter(&self, _transition: &Transition) {}
+    fn on_enter(&self, _transition: &Transition, _context: &mut Context) {}
     /// Called when the state machine exits this state.
-    fn on_exit(&self, _transition: &Transition) {}
+    fn on_exit(&self, _transition: &Transition, _context: &mut Context) {}
     /// Processes an incoming event.
-    fn on_event(&self, event: &E, current: &State, tree: &dyn TreeView) -> EventReply;
+    fn on_event(
+        &self,
+        event: &E,
+        current: &State,
+        context: &mut Context,
+        tree: &dyn TreeView,
+    ) -> EventReply;
 }
 
 /// A registry mapping `State` handles to their respective `Behavior` implementations.
-pub struct Behaviors<'a, E> {
-    map: BTreeMap<State, Box<dyn Behavior<E> + 'a>>,
+pub struct Behaviors<'a, E, Context = ()> {
+    map: BTreeMap<State, Box<dyn Behavior<E, Context> + 'a>>,
 }
 
-impl<E> Default for Behaviors<'_, E> {
+impl<E, Context> Default for Behaviors<'_, E, Context> {
     fn default() -> Self {
         Self {
             map: BTreeMap::new(),
@@ -51,9 +56,9 @@ impl<E> Default for Behaviors<'_, E> {
     }
 }
 
-impl<'a, E> Behaviors<'a, E> {
+impl<'a, E, Context> Behaviors<'a, E, Context> {
     /// Registers a behavior for a specific state.
-    pub fn register(&mut self, state: &State, behavior: impl Behavior<E> + 'a) {
+    pub fn register(&mut self, state: &State, behavior: impl Behavior<E, Context> + 'a) {
         self.map.insert(state.clone(), Box::new(behavior));
     }
 }
@@ -70,17 +75,17 @@ impl<'a, T> Runner<'a, T> {
 
     /// Executes a transition sequence: calls `on_exit` for all exiting states,
     /// followed by `on_enter` for all entering states.
-    pub fn transition<E>(
+    pub fn transition<E, Context>(
         &self,
-        behaviors: &Behaviors<E>,
+        behaviors: &Behaviors<E, Context>,
         current: &State,
         target: &State,
+        context: &mut Context,
     ) -> State {
         let (exit_list, enter_list) = self.tree.propose_transition(current, target);
         let transition = Transition {
             from: current.clone(),
             target: target.clone(),
-            current: current.clone(),
             exit_list,
             enter_list,
         };
@@ -88,18 +93,14 @@ impl<'a, T> Runner<'a, T> {
         // Notify states being exited (from leaf towards LCA)
         for state in &transition.exit_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                let mut step = transition.clone();
-                step.current = state.clone();
-                behavior.on_exit(&step);
+                behavior.on_exit(&transition, context);
             }
         }
 
         // Notify states being entered (from LCA towards target leaf)
         for state in &transition.enter_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                let mut step = transition.clone();
-                step.current = state.clone();
-                behavior.on_enter(&step);
+                behavior.on_enter(&transition, context);
             }
         }
 
@@ -113,19 +114,31 @@ where
 {
     /// Dispatches an event starting from the `current` state.
     /// Follows Run-to-Completion (RTC) semantics.
-    pub fn dispatch<E>(&self, behaviors: &Behaviors<E>, current: &State, event: &E) -> State {
-        match self.bubble(behaviors, current, event) {
-            EventReply::Transition(target) => self.transition(behaviors, current, &target),
+    pub fn dispatch<E, Context>(
+        &self,
+        behaviors: &Behaviors<E, Context>,
+        current: &State,
+        event: &E,
+        context: &mut Context,
+    ) -> State {
+        match self.bubble(behaviors, current, event, context) {
+            EventReply::Transition(target) => self.transition(behaviors, current, &target, context),
             _ => current.clone(),
         }
     }
 
     /// Bubbles an event from the current state up to the root until handled or transitioned.
-    fn bubble<E>(&self, behaviors: &Behaviors<E>, current: &State, event: &E) -> EventReply {
+    fn bubble<E, Context>(
+        &self,
+        behaviors: &Behaviors<E, Context>,
+        current: &State,
+        event: &E,
+        context: &mut Context,
+    ) -> EventReply {
         let mut probe = current.clone();
         loop {
             if let Some(behavior) = behaviors.map.get(&probe) {
-                match behavior.on_event(event, current, self.tree) {
+                match behavior.on_event(event, current, context, self.tree) {
                     EventReply::Ignored => {}
                     other => return other,
                 }
@@ -159,6 +172,13 @@ mod tests {
         Toggle,
     }
 
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Ctx {
+        events: usize,
+        exits: usize,
+        enters: usize,
+    }
+
     /// Thread-safe log to track call sequences and the specific State handles passed.
     #[derive(Default)]
     struct Log {
@@ -167,7 +187,10 @@ mod tests {
 
     impl Log {
         fn push(&self, action: &'static str, transition: &Transition) {
-            self.entries.lock().unwrap().push((action, transition.clone()));
+            self.entries
+                .lock()
+                .unwrap()
+                .push((action, transition.clone()));
         }
         fn take(&self) -> Vec<(&'static str, Transition)> {
             core::mem::take(&mut *self.entries.lock().unwrap())
@@ -179,14 +202,33 @@ mod tests {
         target: State,
     }
 
+    struct CountingBehavior {
+        target: State,
+    }
+
     impl<'a> Behavior<Event> for BlinkyBehavior<'a> {
-        fn on_enter(&self, transition: &Transition) {
+        fn on_enter(&self, transition: &Transition, _ctx: &mut ()) {
             self.log.push("enter", transition);
         }
-        fn on_exit(&self, transition: &Transition) {
+        fn on_exit(&self, transition: &Transition, _ctx: &mut ()) {
             self.log.push("exit", transition);
         }
-        fn on_event(&self, _e: &Event, _c: &State, _t: &dyn TreeView) -> EventReply {
+        fn on_event(&self, _e: &Event, _c: &State, _ctx: &mut (), _t: &dyn TreeView) -> EventReply {
+            EventReply::Transition(self.target.clone())
+        }
+    }
+
+    impl Behavior<Event, Ctx> for CountingBehavior {
+        fn on_enter(&self, _transition: &Transition, ctx: &mut Ctx) {
+            ctx.enters += 1;
+        }
+
+        fn on_exit(&self, _transition: &Transition, ctx: &mut Ctx) {
+            ctx.exits += 1;
+        }
+
+        fn on_event(&self, _e: &Event, _c: &State, ctx: &mut Ctx, _t: &dyn TreeView) -> EventReply {
+            ctx.events += 1;
             EventReply::Transition(self.target.clone())
         }
     }
@@ -219,51 +261,37 @@ mod tests {
         let runner = Runner::new(&tree);
 
         // 1. Dispatch Toggle while in the 'Off' state
-        runner.dispatch(&behaviors, &off, &Event::Toggle);
+        runner.dispatch(&behaviors, &off, &Event::Toggle, &mut ());
         let results = log.take();
         let expected = Transition {
             from: off.clone(),
             target: on.clone(),
-            current: off.clone(),
             exit_list: alloc::vec![off.clone()],
             enter_list: alloc::vec![on.clone()],
         };
-        let expected_enter = Transition {
-            current: on.clone(),
-            ..expected.clone()
-        };
+        let expected_enter = Transition { ..expected.clone() };
 
         // Verify that 'exit' received the 'off' handle and 'enter' received the 'on' handle
         assert_eq!(
             results,
-            [
-                ("exit", expected.clone()),
-                ("enter", expected_enter),
-            ]
+            [("exit", expected.clone()), ("enter", expected_enter),]
         );
 
         // 2. Dispatch Toggle while in the 'On' state
-        runner.dispatch(&behaviors, &on, &Event::Toggle);
+        runner.dispatch(&behaviors, &on, &Event::Toggle, &mut ());
         let results = log.take();
         let expected = Transition {
             from: on.clone(),
             target: off.clone(),
-            current: on.clone(),
             exit_list: alloc::vec![on.clone()],
             enter_list: alloc::vec![off.clone()],
         };
-        let expected_enter = Transition {
-            current: off.clone(),
-            ..expected.clone()
-        };
+        let expected_enter = Transition { ..expected.clone() };
 
         // Verify reverse transition handles
         assert_eq!(
             results,
-            [
-                ("exit", expected.clone()),
-                ("enter", expected_enter),
-            ]
+            [("exit", expected.clone()), ("enter", expected_enter),]
         );
     }
 
@@ -284,23 +312,47 @@ mod tests {
         );
 
         let runner = Runner::new(&tree);
-        runner.dispatch(&behaviors, &off, &Event::Toggle);
+        runner.dispatch(&behaviors, &off, &Event::Toggle, &mut ());
 
         let results = log.take();
         let expected = Transition {
             from: off.clone(),
             target: off.clone(),
-            current: off.clone(),
             exit_list: alloc::vec![off.clone()],
             enter_list: alloc::vec![off.clone()],
         };
         // In a self-transition, both exit and enter should receive the same state handle
+        assert_eq!(results, [("exit", expected.clone()), ("enter", expected),]);
+    }
+
+    #[test]
+    fn custom_context_flows_through_event_and_transition() {
+        let mut tree = StateTree::new(S::Root);
+        let off = tree.add_child(&tree.root(), S::Off);
+        let on = tree.add_child(&tree.root(), S::On);
+
+        let mut behaviors: Behaviors<'_, Event, Ctx> = Behaviors::default();
+        behaviors.register(&off, CountingBehavior { target: on.clone() });
+        behaviors.register(
+            &on,
+            CountingBehavior {
+                target: off.clone(),
+            },
+        );
+
+        let runner = Runner::new(&tree);
+        let mut ctx = Ctx::default();
+
+        let next = runner.dispatch(&behaviors, &off, &Event::Toggle, &mut ctx);
+
+        assert_eq!(next, on);
         assert_eq!(
-            results,
-            [
-                ("exit", expected.clone()),
-                ("enter", expected),
-            ]
+            ctx,
+            Ctx {
+                events: 1,
+                exits: 1,
+                enters: 1,
+            }
         );
     }
 }
