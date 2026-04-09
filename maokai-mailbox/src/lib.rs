@@ -8,13 +8,7 @@ use maokai_tree::{State, StateTree, TreeView};
 
 pub mod runtimes;
 
-#[cfg(feature = "tokio-local")]
-pub use runtimes::tokio_local::TokioLocalRuntime;
-
-#[cfg(feature = "tokio-mt")]
-pub use runtimes::tokio_mt::{SendTaskBox, TokioMtRuntime};
-
-pub trait TaskRuntime<E: 'static, S> {
+pub trait MailboxRuntime<E: 'static, S> {
     type Running;
 
     fn start(&mut self, handle: TaskHandle, task: S) -> Self::Running;
@@ -26,7 +20,7 @@ pub trait TaskRuntime<E: 'static, S> {
 
 pub struct Mailbox<'a, T, E: 'static, C, R, S>
 where
-    R: TaskRuntime<E, S>,
+    R: MailboxRuntime<E, S>,
 {
     runner: Runner<'a, T>,
     behaviors: &'a Behaviors<'a, E, WithTask<C, S>>,
@@ -40,7 +34,7 @@ where
 impl<'a, T, E: 'static, C, R, S> Mailbox<'a, T, E, C, R, S>
 where
     StateTree<T>: TreeView,
-    R: TaskRuntime<E, S>,
+    R: MailboxRuntime<E, S>,
 {
     pub fn new(
         tree: &'a StateTree<T>,
@@ -255,7 +249,7 @@ mod tests {
         }
     }
 
-    impl<E: 'static> TaskRuntime<E, LocalTaskBox<E>> for InlineRuntime<E> {
+    impl<E: 'static> MailboxRuntime<E, LocalTaskBox<E>> for InlineRuntime<E> {
         type Running = TaskHandle;
 
         fn start(&mut self, handle: TaskHandle, task: LocalTaskBox<E>) -> Self::Running {
