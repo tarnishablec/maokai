@@ -1,10 +1,11 @@
 [workspace]
-members = ["maokai-runner", "maokai-tree"]
+members = ["maokai-runner", "maokai-task", "maokai-tree"]
 resolver = "3"
 
 [workspace.dependencies]
 maokai-tree = { path = "maokai-tree" }
 maokai-runner = { path = "maokai-runner" }
+maokai-task = { path = "maokai-task" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
