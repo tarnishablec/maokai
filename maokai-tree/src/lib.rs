@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use indextree::Arena;
 use indextree::NodeId;
 
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Copy)]
 pub struct State(pub(crate) NodeId);
 
 #[derive(Debug, Clone)]
@@ -79,7 +79,7 @@ impl<T> TreeView for StateTree<T> {
         state.0.children(&self.arena).map(State).collect()
     }
     fn root(&self) -> State {
-        self.root.clone()
+        self.root
     }
     fn depth(&self, state: &State) -> usize {
         state.0.ancestors(&self.arena).count()
@@ -87,7 +87,7 @@ impl<T> TreeView for StateTree<T> {
 
     fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
         if current == target {
-            return (alloc::vec![current.clone()], alloc::vec![target.clone()]);
+            return (alloc::vec![*current], alloc::vec![*target]);
         }
 
         let current_path = self.path_rev_iter(current).collect::<Vec<_>>();
@@ -261,7 +261,7 @@ mod tests {
     fn self_transition_emits_exit_and_enter() {
         let (tree, _, b, _, _) = build_tree();
         let (exit, enter) = tree.propose_transition(&b, &b);
-        assert_eq!(exit, alloc::vec![b.clone()]);
+        assert_eq!(exit, alloc::vec![b]);
         assert_eq!(enter, alloc::vec![b]);
     }
 
