@@ -15,22 +15,22 @@ pub trait Task: 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskHandle(u64);
 
-pub enum TaskOp<E: 'static> {
+pub enum TaskOp<T> {
     Start {
         handle: TaskHandle,
-        task: Box<dyn Task<Event = E>>,
+        task: T,
     },
     Stop {
         handle: TaskHandle,
     },
 }
 
-pub struct Reconciler<E: 'static> {
+pub struct Reconciler<T> {
     next_handle: u64,
-    pending: Vec<TaskOp<E>>,
+    pending: Vec<TaskOp<T>>,
 }
 
-impl<E: 'static> Default for Reconciler<E> {
+impl<T> Default for Reconciler<T> {
     fn default() -> Self {
         Self {
             next_handle: 0,
@@ -39,17 +39,11 @@ impl<E: 'static> Default for Reconciler<E> {
     }
 }
 
-impl<E: 'static> Reconciler<E> {
-    pub fn start<T>(&mut self, task: T) -> TaskHandle
-    where
-        T: Task<Event = E>,
-    {
+impl<T> Reconciler<T> {
+    pub fn start(&mut self, task: T) -> TaskHandle {
         let handle = TaskHandle(self.next_handle);
         self.next_handle += 1;
-        self.pending.push(TaskOp::Start {
-            handle,
-            task: Box::new(task),
-        });
+        self.pending.push(TaskOp::Start { handle, task });
         handle
     }
 
@@ -57,17 +51,17 @@ impl<E: 'static> Reconciler<E> {
         self.pending.push(TaskOp::Stop { handle });
     }
 
-    pub fn drain(&mut self) -> Vec<TaskOp<E>> {
+    pub fn drain(&mut self) -> Vec<TaskOp<T>> {
         core::mem::take(&mut self.pending)
     }
 }
 
-pub struct WithTask<E: 'static, C> {
+pub struct WithTask<C, T> {
     context: C,
-    reconciler: Reconciler<E>,
+    reconciler: Reconciler<T>,
 }
 
-impl<E: 'static, C> WithTask<E, C> {
+impl<C, T> WithTask<C, T> {
     pub fn new(context: C) -> Self {
         Self {
             context,
@@ -75,12 +69,12 @@ impl<E: 'static, C> WithTask<E, C> {
         }
     }
 
-    pub fn reconciler(&mut self) -> &mut Reconciler<E> {
+    pub fn reconciler(&mut self) -> &mut Reconciler<T> {
         &mut self.reconciler
     }
 }
 
-impl<E: 'static, C> Deref for WithTask<E, C> {
+impl<C, T> Deref for WithTask<C, T> {
     type Target = C;
 
     fn deref(&self) -> &Self::Target {
@@ -88,7 +82,7 @@ impl<E: 'static, C> Deref for WithTask<E, C> {
     }
 }
 
-impl<E: 'static, C> DerefMut for WithTask<E, C> {
+impl<C, T> DerefMut for WithTask<C, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.context
     }
@@ -97,15 +91,19 @@ impl<E: 'static, C> DerefMut for WithTask<E, C> {
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    use alloc::boxed::Box;
+
     use super::*;
     use maokai_runner::{Behavior, Behaviors, EventReply, Runner, Transition};
     use maokai_tree::{State, StateTree, TreeView};
-
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+    type LocalTaskBox<E> = Box<dyn Task<Event = E>>;
 
     struct DummyTask(u32);
 
@@ -176,12 +174,12 @@ mod tests {
         }
     }
 
-    impl<C> Behavior<Event, WithTask<Event, C>> for IdleBehavior {
+    impl<C> Behavior<Event, WithTask<C, LocalTaskBox<Event>>> for IdleBehavior {
         fn on_event(
             &self,
             event: &Event,
             _current: &State,
-            _context: &mut WithTask<Event, C>,
+            _context: &mut WithTask<C, LocalTaskBox<Event>>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -191,17 +189,27 @@ mod tests {
         }
     }
 
-    impl<C> Behavior<Event, WithTask<Event, C>> for LoadingBehavior
+    impl<C> Behavior<Event, WithTask<C, LocalTaskBox<Event>>> for LoadingBehavior
     where
         C: core::borrow::BorrowMut<Ctx>,
     {
-        fn on_enter(&self, _transition: &Transition, context: &mut WithTask<Event, C>) {
-            let handle = context.reconciler().start(EventTask);
+        fn on_enter(
+            &self,
+            _transition: &Transition,
+            context: &mut WithTask<C, LocalTaskBox<Event>>,
+        ) {
+            let handle = context
+                .reconciler()
+                .start(Box::new(EventTask) as LocalTaskBox<Event>);
             let ctx: &mut Ctx = core::borrow::BorrowMut::borrow_mut(&mut context.context);
             ctx.active_task = Some(handle);
         }
 
-        fn on_exit(&self, _transition: &Transition, context: &mut WithTask<Event, C>) {
+        fn on_exit(
+            &self,
+            _transition: &Transition,
+            context: &mut WithTask<C, LocalTaskBox<Event>>,
+        ) {
             let handle = {
                 let ctx: &mut Ctx = core::borrow::BorrowMut::borrow_mut(&mut context.context);
                 ctx.active_task.take()
@@ -216,7 +224,7 @@ mod tests {
             &self,
             event: &Event,
             _current: &State,
-            _context: &mut WithTask<Event, C>,
+            _context: &mut WithTask<C, LocalTaskBox<Event>>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -228,10 +236,10 @@ mod tests {
 
     #[test]
     fn start_returns_incrementing_handles() {
-        let mut reconciler = Reconciler::<u32>::default();
+        let mut reconciler = Reconciler::<LocalTaskBox<u32>>::default();
 
-        let first = reconciler.start(DummyTask(1));
-        let second = reconciler.start(DummyTask(2));
+        let first = reconciler.start(Box::new(DummyTask(1)) as LocalTaskBox<u32>);
+        let second = reconciler.start(Box::new(DummyTask(2)) as LocalTaskBox<u32>);
 
         assert_ne!(first, second);
         match reconciler.drain().as_slice() {
@@ -247,8 +255,8 @@ mod tests {
 
     #[test]
     fn stop_is_recorded_and_drain_clears_pending() {
-        let mut reconciler = Reconciler::<u32>::default();
-        let handle = reconciler.start(DummyTask(7));
+        let mut reconciler = Reconciler::<LocalTaskBox<u32>>::default();
+        let handle = reconciler.start(Box::new(DummyTask(7)) as LocalTaskBox<u32>);
 
         reconciler.stop(handle);
 
@@ -268,10 +276,12 @@ mod tests {
 
     #[test]
     fn with_task_exposes_context_and_reconciler() {
-        let mut with_task = WithTask::<u32, _>::new(Ctx::default());
+        let mut with_task = WithTask::<_, LocalTaskBox<u32>>::new(Ctx::default());
 
         with_task.count += 1;
-        let handle = with_task.reconciler().start(DummyTask(3));
+        let handle = with_task
+            .reconciler()
+            .start(Box::new(DummyTask(3)) as LocalTaskBox<u32>);
 
         assert_eq!(with_task.count, 1);
         match with_task.reconciler().drain().as_slice() {
@@ -293,7 +303,7 @@ mod tests {
         behaviors.register(&loading, LoadingBehavior { idle });
 
         let runner = Runner::new(&tree);
-        let mut context = WithTask::<Event, _>::new(Ctx::default());
+        let mut context = WithTask::<_, LocalTaskBox<Event>>::new(Ctx::default());
 
         let current = runner.dispatch(&behaviors, &idle, &Event::Begin, &mut context);
         assert_eq!(current, loading);
@@ -323,7 +333,7 @@ mod tests {
         let (tree, idle, loading) = build_task_tree();
 
         let mut ctx = Ctx::default();
-        let mut context = WithTask::<Event, _>::new(&mut ctx);
+        let mut context = WithTask::<_, LocalTaskBox<Event>>::new(&mut ctx);
 
         let mut behaviors = Behaviors::default();
         behaviors.register(&idle, IdleBehavior { loading });

@@ -20,6 +20,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb9e21e48c85fa6643a38caca564645a3bbc9211edf506fc8ed690c7e7b4d3c7"
 
 [[package]]
+name = "maokai-mailbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "maokai-runner",
+ "maokai-task",
+ "maokai-tree",
+ "tokio",
+]
+
+[[package]]
 name = "maokai-runner"
 version = "0.2.1"
 dependencies = [
@@ -41,6 +52,12 @@ version = "0.2.1"
 dependencies = [
  "indextree",
 ]
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "proc-macro2"
@@ -69,6 +86,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tokio"
+version = "1.51.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+dependencies = [
+ "pin-project-lite",
 ]
 
 [[package]]

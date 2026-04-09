@@ -1,0 +1,19 @@
+[package]
+name = "maokai-mailbox"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+tokio-local = ["dep:tokio", "tokio/rt", "tokio/sync"]
+tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync"]
+
+[dependencies]
+maokai-tree = { workspace = true }
+maokai-runner = { workspace = true }
+maokai-task = { workspace = true }
+async-trait = { workspace = true, features = [] }
+tokio = { workspace = true, optional = true }
+
+[lints]
+workspace = true

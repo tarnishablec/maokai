@@ -7,7 +7,7 @@ edition = "2024"
 maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 
-async-trait = { version = "*", default-features = false, features = [] }
+async-trait = { workspace = true, features = [] }
 
 [lints]
 workspace = true
