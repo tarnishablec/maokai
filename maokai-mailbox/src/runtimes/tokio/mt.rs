@@ -142,7 +142,7 @@ mod tests {
 
             for _ in 0..64 {
                 tokio::task::yield_now().await;
-                std::thread::sleep(Duration::from_millis(1));
+                tokio::time::sleep(Duration::from_millis(1)).await;
                 mailbox.run_until_stable();
                 if mailbox.current() == *idle {
                     break;
@@ -191,7 +191,7 @@ mod tests {
 
             for _ in 0..16 {
                 tokio::task::yield_now().await;
-                std::thread::sleep(Duration::from_millis(1));
+                tokio::time::sleep(Duration::from_millis(1)).await;
                 mailbox.run_until_stable();
             }
 

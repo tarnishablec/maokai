@@ -13,7 +13,7 @@ maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 maokai-task = { workspace = true }
 async-trait = { workspace = true, features = [] }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, version = "1.0.0", features = ["time"] }
 
 [lints]
 workspace = true
