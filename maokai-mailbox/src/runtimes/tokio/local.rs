@@ -44,3 +44,8 @@ impl<E: 'static> MailboxRuntime<E> for TokioLocalRuntime<E> {
         self.rx.try_recv().ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    
+}

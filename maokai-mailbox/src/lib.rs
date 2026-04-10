@@ -20,17 +20,17 @@ pub trait MailboxRuntime<E: 'static> {
     fn poll(&mut self) -> Option<(TaskHandle, E)>;
 }
 
-pub struct Mailbox<'a, T, E: 'static, C, R>
+pub struct Mailbox<'a, Tree, Event: 'static, Context, Runtime>
 where
-    R: MailboxRuntime<E>,
+    Runtime: MailboxRuntime<Event>,
 {
-    runner: Runner<'a, T>,
-    behaviors: &'a Behaviors<'a, E, WithTask<C, E>>,
+    runner: Runner<'a, Tree>,
+    behaviors: &'a Behaviors<'a, Event, WithTask<Context, Event>>,
     current: State,
-    context: WithTask<C, E>,
-    queue: VecDeque<E>,
-    runtime: R,
-    running: BTreeMap<TaskHandle, R::Running>,
+    context: WithTask<Context, Event>,
+    queue: VecDeque<Event>,
+    runtime: Runtime,
+    running: BTreeMap<TaskHandle, Runtime::Running>,
 }
 
 impl<'a, Tree, Event: 'static, Context, Runtime> Mailbox<'a, Tree, Event, Context, Runtime>
