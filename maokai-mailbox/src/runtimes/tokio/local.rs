@@ -6,13 +6,13 @@ use crate::MailboxRuntime;
 pub type LocalTaskBox<E> = Box<dyn Task<Event = E>>;
 
 pub struct TokioLocalRuntime<E: 'static> {
-    tx: ::tokio::sync::mpsc::UnboundedSender<(TaskHandle, E)>,
-    rx: ::tokio::sync::mpsc::UnboundedReceiver<(TaskHandle, E)>,
+    tx: tokio::sync::mpsc::UnboundedSender<(TaskHandle, E)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(TaskHandle, E)>,
 }
 
 impl<E: 'static> TokioLocalRuntime<E> {
     pub fn new() -> Self {
-        let (tx, rx) = ::tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self { tx, rx }
     }
 }
@@ -24,13 +24,13 @@ impl<E: 'static> Default for TokioLocalRuntime<E> {
 }
 
 impl<E: 'static> MailboxRuntime<E, LocalTaskBox<E>> for TokioLocalRuntime<E> {
-    type Running = ::tokio::task::JoinHandle<()>;
+    type Running = tokio::task::JoinHandle<()>;
 
     fn start(&mut self, handle: TaskHandle, task: LocalTaskBox<E>) -> Self::Running {
         let tx = self.tx.clone();
 
         // `Task` is not required to be `Send`, so the local Tokio runtime uses `spawn_local`.
-        ::tokio::task::spawn_local(async move {
+        tokio::task::spawn_local(async move {
             let event = task.run().await;
             let _ = tx.send((handle, event));
         })
@@ -40,7 +40,7 @@ impl<E: 'static> MailboxRuntime<E, LocalTaskBox<E>> for TokioLocalRuntime<E> {
         running.abort();
     }
 
-    fn poll_completed(&mut self) -> Option<(TaskHandle, E)> {
+    fn poll(&mut self) -> Option<(TaskHandle, E)> {
         self.rx.try_recv().ok()
     }
 }
@@ -101,16 +101,16 @@ mod tests {
 
     #[test]
     fn tokio_local_runtime_runs_send_task_mailbox_case() {
-        let runtime = ::tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current-thread tokio runtime should build");
-        let local = ::tokio::task::LocalSet::new();
+        let local = tokio::task::LocalSet::new();
 
         SEND_TASK_RUNS.store(0, Ordering::SeqCst);
         local.block_on(&runtime, async {
             run_mailbox_case(TokioLocalRuntime::new(), make_send_task, |task| {
-                Box::new(task) as LocalTaskBox<Event>
+                Box::new(task)
             })
             .await;
         });
@@ -120,16 +120,16 @@ mod tests {
 
     #[test]
     fn tokio_local_runtime_runs_non_send_task_mailbox_case() {
-        let runtime = ::tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current-thread tokio runtime should build");
-        let local = ::tokio::task::LocalSet::new();
+        let local = tokio::task::LocalSet::new();
 
         LOCAL_TASK_RUNS.store(0, Ordering::SeqCst);
         local.block_on(&runtime, async {
             run_mailbox_case(TokioLocalRuntime::new(), make_local_task, |task| {
-                Box::new(task) as LocalTaskBox<Event>
+                Box::new(task)
             })
             .await;
         });

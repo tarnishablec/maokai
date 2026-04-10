@@ -65,14 +65,16 @@ pub(crate) mod test_support {
         W: Fn(T) -> S + Send + Sync + 'static,
     {
         fn on_enter(&self, _transition: &Transition, context: &mut WithTask<C, S>) {
-            let handle = context.reconciler().start((self.wrap_task)((self.make_task)()));
-            let ctx: &mut Ctx = core::borrow::BorrowMut::borrow_mut(&mut **context);
+            let handle = context
+                .reconciler()
+                .start((self.wrap_task)((self.make_task)()));
+            let ctx = core::borrow::BorrowMut::borrow_mut(&mut **context);
             ctx.active_task = Some(handle);
         }
 
         fn on_exit(&self, _transition: &Transition, context: &mut WithTask<C, S>) {
             let handle = {
-                let ctx: &mut Ctx = core::borrow::BorrowMut::borrow_mut(&mut **context);
+                let ctx = core::borrow::BorrowMut::borrow_mut(&mut **context);
                 ctx.active_task.take()
             };
 
@@ -131,8 +133,7 @@ pub(crate) mod test_support {
     {
         let (tree, idle, loading) = &*INSTANCE_TREE;
         let behaviors = build_behaviors(*idle, *loading, make_task, wrap_task);
-        let mut mailbox =
-            Mailbox::new(tree, &behaviors, *idle, WithTask::<_, S>::new(Ctx::default()), runtime);
+        let mut mailbox = Mailbox::new(tree, &behaviors, *idle, Ctx::default(), runtime);
 
         mailbox.post(Event::Begin);
 

@@ -15,13 +15,13 @@ impl<E: 'static> SendTaskBox<E> {
 }
 
 pub struct TokioMtRuntime<E: Send + 'static> {
-    tx: ::tokio::sync::mpsc::UnboundedSender<(TaskHandle, E)>,
-    rx: ::tokio::sync::mpsc::UnboundedReceiver<(TaskHandle, E)>,
+    tx: tokio::sync::mpsc::UnboundedSender<(TaskHandle, E)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(TaskHandle, E)>,
 }
 
 impl<E: Send + 'static> TokioMtRuntime<E> {
     pub fn new() -> Self {
-        let (tx, rx) = ::tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self { tx, rx }
     }
 }
@@ -33,12 +33,12 @@ impl<E: Send + 'static> Default for TokioMtRuntime<E> {
 }
 
 impl<E: Send + 'static> MailboxRuntime<E, SendTaskBox<E>> for TokioMtRuntime<E> {
-    type Running = ::tokio::task::JoinHandle<()>;
+    type Running = tokio::task::JoinHandle<()>;
 
     fn start(&mut self, handle: TaskHandle, task: SendTaskBox<E>) -> Self::Running {
         let tx = self.tx.clone();
 
-        ::tokio::spawn(async move {
+        tokio::spawn(async move {
             let event = task.0.run().await;
             let _ = tx.send((handle, event));
         })
@@ -48,7 +48,7 @@ impl<E: Send + 'static> MailboxRuntime<E, SendTaskBox<E>> for TokioMtRuntime<E> 
         running.abort();
     }
 
-    fn poll_completed(&mut self) -> Option<(TaskHandle, E)> {
+    fn poll(&mut self) -> Option<(TaskHandle, E)> {
         self.rx.try_recv().ok()
     }
 }
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn tokio_mt_runtime_runs_send_task_mailbox_case() {
-        let runtime = ::tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()

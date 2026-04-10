@@ -15,7 +15,7 @@ pub trait MailboxRuntime<E: 'static, S> {
 
     fn stop(&mut self, running: Self::Running);
 
-    fn poll_completed(&mut self) -> Option<(TaskHandle, E)>;
+    fn poll(&mut self) -> Option<(TaskHandle, E)>;
 }
 
 pub struct Mailbox<'a, T, E: 'static, C, R, S>
@@ -40,14 +40,14 @@ where
         tree: &'a StateTree<T>,
         behaviors: &'a Behaviors<'a, E, WithTask<C, S>>,
         initial: State,
-        context: WithTask<C, S>,
+        context: C,
         runtime: R,
     ) -> Self {
         Self {
             runner: Runner::new(tree),
             behaviors,
             current: initial,
-            context,
+            context: WithTask::new(context),
             queue: VecDeque::new(),
             runtime,
             running: BTreeMap::new(),
@@ -73,7 +73,7 @@ where
     pub fn step(&mut self) -> bool {
         let mut progressed = false;
 
-        if let Some((handle, event)) = self.runtime.poll_completed()
+        if let Some((handle, event)) = self.runtime.poll()
             && self.running.contains_key(&handle)
         {
             self.queue.push_back(event);
@@ -262,7 +262,7 @@ mod tests {
             self.stopped.push(running);
         }
 
-        fn poll_completed(&mut self) -> Option<(TaskHandle, E)> {
+        fn poll(&mut self) -> Option<(TaskHandle, E)> {
             self.completed.pop_front()
         }
     }
@@ -283,13 +283,7 @@ mod tests {
         behaviors.register(&loading, LoadingBehavior { idle });
 
         let runtime = InlineRuntime::default();
-        let mut mailbox = Mailbox::new(
-            &tree,
-            &behaviors,
-            idle,
-            WithTask::<_, LocalTaskBox<Event>>::new(Ctx::default()),
-            runtime,
-        );
+        let mut mailbox = Mailbox::new(&tree, &behaviors, idle, Ctx::default(), runtime);
 
         mailbox.post(Event::Begin);
         mailbox.run_until_stable();
@@ -297,5 +291,27 @@ mod tests {
         assert_eq!(mailbox.current(), idle);
         assert_eq!(mailbox.context().active_task, None);
         assert_eq!(mailbox.runtime.stopped.len(), 1);
+    }
+
+    #[test]
+    fn mailbox_new_accepts_borrowed_context() {
+        let (tree, idle, loading) = build_tree();
+        let mut outer_ctx = Ctx::default();
+
+        {
+            let mut behaviors = Behaviors::default();
+            behaviors.register(&idle, IdleBehavior { loading });
+            behaviors.register(&loading, LoadingBehavior { idle });
+            let runtime = InlineRuntime::default();
+            let mut mailbox = Mailbox::new(&tree, &behaviors, idle, &mut outer_ctx, runtime);
+
+            mailbox.post(Event::Begin);
+            mailbox.run_until_stable();
+
+            assert_eq!(mailbox.current(), idle);
+            assert_eq!(mailbox.runtime.stopped.len(), 1);
+        }
+
+        assert_eq!(outer_ctx.active_task, None);
     }
 }
