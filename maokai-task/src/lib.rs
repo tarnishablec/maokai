@@ -15,22 +15,26 @@ pub trait Task: 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskHandle(u64);
 
-pub enum TaskOp<E> {
-    Start {
-        handle: TaskHandle,
-        task: Box<dyn Task<Event = E>>,
-    },
-    Stop {
-        handle: TaskHandle,
-    },
+pub enum TaskOp<E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
+    Start { handle: TaskHandle, task: Box<T> },
+    Stop { handle: TaskHandle },
 }
 
-pub struct Reconciler<E> {
+pub struct Reconciler<E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     next_handle: u64,
-    pending: Vec<TaskOp<E>>,
+    pending: Vec<TaskOp<E, T>>,
 }
 
-impl<E> Default for Reconciler<E> {
+impl<E, T> Default for Reconciler<E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     fn default() -> Self {
         Self {
             next_handle: 0,
@@ -39,8 +43,11 @@ impl<E> Default for Reconciler<E> {
     }
 }
 
-impl<E> Reconciler<E> {
-    pub fn start(&mut self, task: Box<dyn Task<Event = E>>) -> TaskHandle {
+impl<E, T> Reconciler<E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
+    pub fn start(&mut self, task: Box<T>) -> TaskHandle {
         let handle = TaskHandle(self.next_handle);
         self.next_handle += 1;
         self.pending.push(TaskOp::Start { handle, task });
@@ -51,17 +58,23 @@ impl<E> Reconciler<E> {
         self.pending.push(TaskOp::Stop { handle });
     }
 
-    pub fn drain(&mut self) -> Vec<TaskOp<E>> {
+    pub fn drain(&mut self) -> Vec<TaskOp<E, T>> {
         core::mem::take(&mut self.pending)
     }
 }
 
-pub struct WithTask<C, E> {
+pub struct TaskContext<C, E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     context: C,
-    reconciler: Reconciler<E>,
+    reconciler: Reconciler<E, T>,
 }
 
-impl<C, E> WithTask<C, E> {
+impl<C, E, T> TaskContext<C, E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     pub fn new(context: C) -> Self {
         Self {
             context,
@@ -69,12 +82,15 @@ impl<C, E> WithTask<C, E> {
         }
     }
 
-    pub fn reconciler(&mut self) -> &mut Reconciler<E> {
+    pub fn reconciler(&mut self) -> &mut Reconciler<E, T> {
         &mut self.reconciler
     }
 }
 
-impl<C, E> Deref for WithTask<C, E> {
+impl<C, E, T> Deref for TaskContext<C, E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     type Target = C;
 
     fn deref(&self) -> &Self::Target {
@@ -82,7 +98,10 @@ impl<C, E> Deref for WithTask<C, E> {
     }
 }
 
-impl<C, E> DerefMut for WithTask<C, E> {
+impl<C, E, T> DerefMut for TaskContext<C, E, T>
+where
+    T: Task<Event = E> + ?Sized + 'static,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.context
     }

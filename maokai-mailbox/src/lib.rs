@@ -4,14 +4,14 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use maokai_runner::{Behaviors, Runner};
-use maokai_task::{Task, TaskHandle, TaskOp, WithTask};
+use maokai_task::{Task, TaskHandle, TaskOp, TaskContext};
 use maokai_tree::{State, StateTree, TreeView};
 
 pub mod runtimes;
 
 pub trait MailboxRuntime<E: 'static> {
     type Running;
-    type Task: ?Sized + 'static;
+    type Task: Task<Event = E> + ?Sized + 'static;
 
     fn start(&mut self, handle: TaskHandle, task: Box<Self::Task>) -> Self::Running;
 
@@ -25,9 +25,9 @@ where
     Runtime: MailboxRuntime<Event>,
 {
     runner: Runner<'a, Tree>,
-    behaviors: &'a Behaviors<'a, Event, WithTask<Context, Event>>,
+    behaviors: &'a Behaviors<'a, Event, TaskContext<Context, Event, Runtime::Task>>,
     current: State,
-    context: WithTask<Context, Event>,
+    context: TaskContext<Context, Event, Runtime::Task>,
     queue: VecDeque<Event>,
     runtime: Runtime,
     running: BTreeMap<TaskHandle, Runtime::Running>,
@@ -36,11 +36,11 @@ where
 impl<'a, Tree, Event: 'static, Context, Runtime> Mailbox<'a, Tree, Event, Context, Runtime>
 where
     StateTree<Tree>: TreeView,
-    Runtime: MailboxRuntime<Event, Task = dyn Task<Event = Event>>,
+    Runtime: MailboxRuntime<Event>,
 {
     pub fn new(
         tree: &'a StateTree<Tree>,
-        behaviors: &'a Behaviors<'a, Event, WithTask<Context, Event>>,
+        behaviors: &'a Behaviors<'a, Event, TaskContext<Context, Event, Runtime::Task>>,
         initial: State,
         context: Context,
         runtime: Runtime,
@@ -49,7 +49,7 @@ where
             runner: Runner::new(tree),
             behaviors,
             current: initial,
-            context: WithTask::new(context),
+            context: TaskContext::new(context),
             queue: VecDeque::new(),
             runtime,
             running: BTreeMap::new(),
