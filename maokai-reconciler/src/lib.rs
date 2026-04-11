@@ -1,14 +1,11 @@
 #![no_std]
 extern crate alloc;
 
-#[macro_use]
-extern crate downcast;
-
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use downcast::Any;
+use downcast::{Any, impl_downcast};
 
 pub trait Operation: Any {}
 
