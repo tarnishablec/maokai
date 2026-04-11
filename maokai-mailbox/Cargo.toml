@@ -11,7 +11,7 @@ tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync"]
 [dependencies]
 maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
-maokai-task = { workspace = true }
+maokai-reconciler = { workspace = true }
 async-trait = { workspace = true, features = [] }
 tokio = { workspace = true, optional = true, version = "1.0.0", features = ["time"] }
 

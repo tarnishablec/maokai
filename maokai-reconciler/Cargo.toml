@@ -1,0 +1,10 @@
+[package]
+name = "maokai-reconciler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+downcast = { workspace = true }
+
+[lints]
+workspace = true
