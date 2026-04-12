@@ -4,10 +4,15 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::any::type_name;
 use core::cmp::Ordering;
 use downcast::{Any, impl_downcast};
 
-pub trait Operation: Any {}
+pub trait Operation: Any {
+    fn operation_key(&self) -> &'static str {
+        type_name::<Self>()
+    }
+}
 
 impl_downcast!(dyn Operation);
 
@@ -187,5 +192,4 @@ impl Reconciler {
     pub fn clear_rules(&mut self) {
         self.rules.clear();
     }
-
 }

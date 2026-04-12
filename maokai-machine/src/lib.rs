@@ -2,10 +2,10 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
-use alloc::vec;
-use alloc::vec::Vec;
+use core::any::type_name;
 use core::cell::RefCell;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
@@ -23,19 +23,24 @@ pub struct Machine<'a, 'b, T, E, C> {
     behaviors: &'b Behaviors<'b, E, Envelope<C>>,
     current: State,
     ready_events: SharedEventQueue<E>,
-    consumers: Vec<Box<dyn OpConsumer>>,
+    consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
 }
 
 impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
     pub fn new(runner: &'a Runner<'a, T>, behaviors: &'b Behaviors<'b, E, Envelope<C>>) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
+        let mut consumers = BTreeMap::new();
+        consumers.insert(
+            type_name::<EventOp<E>>(),
+            Box::new(EventOpConsumer::<E>::new(ready_events.clone())) as Box<dyn OpConsumer>,
+        );
 
         Self {
             runner,
             behaviors,
             current: runner.tree.nil(),
             ready_events: ready_events.clone(),
-            consumers: vec![Box::new(EventOpConsumer::<E>::new(ready_events.clone()))],
+            consumers,
         }
     }
 
@@ -43,24 +48,27 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
         self.current
     }
 
-    pub fn add_consumer<Cn>(&mut self, consumer: Cn) -> &mut Self
+    pub fn set_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
     where
+        O: Operation + 'static,
         Cn: OpConsumer + 'static,
     {
-        self.consumers.push(Box::new(consumer));
-        self
+        self.consumers.insert(type_name::<O>(), Box::new(consumer))
     }
 
-    pub fn remove_consumer(&mut self, index: usize) -> Option<Box<dyn OpConsumer>> {
-        if index < self.consumers.len() {
-            Some(self.consumers.remove(index))
-        } else {
-            None
-        }
+    pub fn remove_consumer<O>(&mut self) -> Option<Box<dyn OpConsumer>>
+    where
+        O: Operation + 'static,
+    {
+        self.consumers.remove(type_name::<O>())
     }
 
     pub fn clear_consumers(&mut self) {
-        self.consumers.clear();
+        self.consumers = BTreeMap::new();
+        self.consumers.insert(
+            type_name::<EventOp<E>>(),
+            Box::new(EventOpConsumer::<E>::new(self.ready_events.clone())),
+        );
     }
 }
 
@@ -107,20 +115,14 @@ where
     ) {
         loop {
             context.reconciler.commit(|ticket, op| {
-                let mut current = Some(op);
+                let key = op.operation_key();
 
-                for consumer in self.consumers.iter_mut() {
-                    let Some(op) = current.take() else {
-                        break;
-                    };
-
+                if let Some(consumer) = self.consumers.get_mut(key) {
                     match consumer.as_mut().consume(ticket, op) {
-                        OpFlow::Consumed => break,
-                        OpFlow::Continue(op) => current = Some(op),
+                        OpFlow::Consumed => {}
+                        OpFlow::Continue(op) => on_unhandled(ticket, op),
                     }
-                }
-
-                if let Some(op) = current {
+                } else {
                     on_unhandled(ticket, op);
                 }
             });
