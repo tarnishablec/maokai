@@ -1,10 +1,12 @@
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::rc::Rc;
+use core::cell::RefCell;
 use downcast::Downcast;
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Ticket};
-use alloc::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskHandle(pub u64);
+pub struct TaskHandle(u64);
 
 pub enum TaskOp<T> {
     Start { handle: TaskHandle, task: T },
@@ -13,21 +15,26 @@ pub enum TaskOp<T> {
 
 impl<T: 'static> Operation for TaskOp<T> {}
 
-//
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompletion<O> {
     pub handle: TaskHandle,
     pub output: O,
 }
 
+pub type CompletionSink<O> = Rc<RefCell<VecDeque<TaskCompletion<O>>>>;
+
 pub trait TaskRuntime<T> {
     type Running;
     type Output;
 
-    fn start(&mut self, handle: TaskHandle, task: T) -> Self::Running;
+    fn start(
+        &mut self,
+        handle: TaskHandle,
+        task: T,
+        sink: CompletionSink<Self::Output>,
+    ) -> Self::Running;
+
     fn stop(&mut self, handle: TaskHandle, running: Self::Running);
-    fn poll(&mut self) -> Option<TaskCompletion<Self::Output>>;
 }
 
 pub struct TaskOpConsumer<R, T>
@@ -36,6 +43,8 @@ where
 {
     runtime: R,
     running: BTreeMap<TaskHandle, R::Running>,
+    completions: CompletionSink<R::Output>,
+    next_handle: u64,
 }
 
 impl<R, T> TaskOpConsumer<R, T>
@@ -46,7 +55,19 @@ where
         Self {
             runtime,
             running: BTreeMap::new(),
+            completions: Rc::new(RefCell::new(VecDeque::new())),
+            next_handle: 0,
         }
+    }
+
+    pub fn next_handle(&mut self) -> TaskHandle {
+        let h = TaskHandle(self.next_handle);
+        self.next_handle += 1;
+        h
+    }
+
+    pub fn completions(&self) -> &CompletionSink<R::Output> {
+        &self.completions
     }
 
     pub fn runtime(&self) -> &R {
@@ -55,12 +76,6 @@ where
 
     pub fn runtime_mut(&mut self) -> &mut R {
         &mut self.runtime
-    }
-
-    pub fn poll(&mut self) -> Option<TaskCompletion<R::Output>> {
-        let completion = self.runtime.poll()?;
-        self.running.remove(&completion.handle);
-        Some(completion)
     }
 }
 
@@ -74,7 +89,8 @@ where
             Ok(task_op) => {
                 match *task_op {
                     TaskOp::Start { handle, task } => {
-                        let running = self.runtime.start(handle, task);
+                        let running =
+                            self.runtime.start(handle, task, self.completions.clone());
                         self.running.insert(handle, running);
                     }
                     TaskOp::Stop(handle) => {
