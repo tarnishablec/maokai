@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use indextree::Arena;
 use indextree::NodeId;
@@ -21,18 +22,25 @@ pub struct State(pub(crate) NodeId);
 
 #[derive(Debug, Clone)]
 pub struct StateTree<T> {
-    arena: Arena<T>,
+    arena: Arena<Option<T>>,
     root: State,
+    nil: State,
 }
 
 impl<T> StateTree<T> {
     pub fn new(root_data: T) -> Self {
         let mut arena = Arena::new();
-        let root = arena.new_node(root_data);
+        let root = arena.new_node(Some(root_data));
+        let nil = arena.new_node(None);
         Self {
             arena,
             root: State(root),
+            nil: State(nil),
         }
+    }
+
+    pub fn nil(&self) -> State {
+        self.nil
     }
 
     pub fn path_rev_iter(&self, state: &State) -> impl Iterator<Item = NodeId> {
@@ -40,7 +48,9 @@ impl<T> StateTree<T> {
     }
 
     pub fn add_child(&mut self, parent: &State, data: T) -> State {
-        let child = self.arena.new_node(data);
+        debug_assert_ne!(*parent, self.nil, "cannot add child to nil state");
+
+        let child = self.arena.new_node(Some(data));
         parent.0.append(child, &mut self.arena);
         State(child)
     }
@@ -87,16 +97,11 @@ impl<T> TreeView for StateTree<T> {
 
     fn propose_transition(&self, current: &State, target: &State) -> (Vec<State>, Vec<State>) {
         if current == target {
-            return (alloc::vec![*current], alloc::vec![*target]);
+            return (vec![*current], vec![*target]);
         }
 
         let current_path = self.path_rev_iter(current).collect::<Vec<_>>();
         let target_path = self.path_rev_iter(target).collect::<Vec<_>>();
-
-        debug_assert!(
-            current_path.last() == Some(&self.root.0) && target_path.last() == Some(&self.root.0),
-            "State nodes must belong to the same StateTree root!",
-        );
 
         let mut i = current_path.len();
         let mut j = target_path.len();
@@ -125,7 +130,7 @@ pub trait DataView<T>: TreeView {
 
 impl<T> DataView<T> for StateTree<T> {
     fn get_data(&self, state: &State) -> Option<&T> {
-        self.arena.get(state.0).map(|node| node.get())
+        self.arena.get(state.0).and_then(|node| node.get().as_ref())
     }
 
     /// Iterates payload data from root to `state`.
@@ -136,7 +141,7 @@ impl<T> DataView<T> for StateTree<T> {
         let mut ids: Vec<NodeId> = self.path_rev_iter(state).collect();
         ids.reverse();
         ids.into_iter()
-            .filter_map(move |id| self.arena.get(id).map(|n| n.get()))
+            .filter_map(move |id| self.arena.get(id).and_then(|n| n.get().as_ref()))
     }
 }
 

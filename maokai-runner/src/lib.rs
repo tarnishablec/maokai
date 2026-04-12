@@ -40,11 +40,13 @@ pub trait Behavior<E, C = ()>: Send + Sync {
     /// Processes an incoming event.
     fn on_event(
         &self,
-        event: &E,
-        current: &State,
-        context: &mut C,
-        tree: &dyn TreeView,
-    ) -> EventReply;
+        _event: &E,
+        _current: &State,
+        _context: &mut C,
+        _tree: &dyn TreeView,
+    ) -> EventReply {
+        EventReply::Handled
+    }
 }
 
 /// A registry mapping `State` handles to their respective `Behavior` implementations.
