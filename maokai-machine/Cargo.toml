@@ -12,8 +12,7 @@ tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync"]
 maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 maokai-reconciler = { workspace = true }
-maokai-contracts = { workspace = true }
-downcast = { workspace = true }
+maokai-gears = { workspace = true }
 tokio = { workspace = true, optional = true, version = "1.0.0", features = ["time"] }
 
 [lints]

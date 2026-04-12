@@ -13,7 +13,6 @@ impl_downcast!(dyn Operation);
 
 pub enum OpFlow {
     Consumed,
-    // Discarded,
     Continue(Box<dyn Operation>),
 }
 
@@ -81,7 +80,6 @@ pub trait RuleAccess {
 pub struct Reconciler {
     next_ticket: u32,
     pub(crate) rules: Vec<Box<dyn Rule>>,
-    pub(crate) consumers: Vec<Box<dyn OpConsumer>>,
     pub(crate) pending_ops: BTreeMap<Ticket, Box<dyn Operation>>,
 }
 
@@ -170,31 +168,6 @@ impl Reconciler {
         }
     }
 
-    pub fn flush(&mut self, mut on_unhandled: impl FnMut(Ticket, Box<dyn Operation>)) {
-        let mut consumers = core::mem::take(&mut self.consumers);
-
-        self.commit(|ticket, op| {
-            let mut current = Some(op);
-
-            for consumer in consumers.iter_mut() {
-                let Some(op) = current.take() else {
-                    break;
-                };
-
-                match consumer.consume(ticket, op) {
-                    OpFlow::Consumed => break,
-                    OpFlow::Continue(op) => current = Some(op),
-                }
-            }
-
-            if let Some(op) = current {
-                on_unhandled(ticket, op);
-            }
-        });
-
-        self.consumers = consumers;
-    }
-
     pub fn add_rule<R>(&mut self, rule: R) -> &mut Self
     where
         R: Rule + 'static,
@@ -215,23 +188,4 @@ impl Reconciler {
         self.rules.clear();
     }
 
-    pub fn add_consumer<C>(&mut self, consumer: C) -> &mut Self
-    where
-        C: OpConsumer + 'static,
-    {
-        self.consumers.push(Box::new(consumer));
-        self
-    }
-
-    pub fn remove_consumer(&mut self, index: usize) -> Option<Box<dyn OpConsumer>> {
-        if index < self.consumers.len() {
-            Some(self.consumers.remove(index))
-        } else {
-            None
-        }
-    }
-
-    pub fn clear_consumers(&mut self) {
-        self.consumers.clear();
-    }
 }

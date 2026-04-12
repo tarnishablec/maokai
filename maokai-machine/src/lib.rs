@@ -3,9 +3,13 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use downcast::Downcast;
-use maokai_contracts::ops::EventOp;
-use maokai_reconciler::{Operation, Reconciler, Ticket};
+use alloc::rc::Rc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use maokai_gears::ops::EventOp;
+use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
+use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
@@ -18,19 +22,54 @@ pub struct Machine<'a, 'b, T, E, C> {
     runner: &'a Runner<'a, T>,
     behaviors: &'b Behaviors<'b, E, Envelope<C>>,
     current: State,
+    ready_events: SharedEventQueue<E>,
+    consumers: Vec<Box<dyn OpConsumer>>,
 }
 
-impl<'a, 'b, T, E, C> Machine<'a, 'b, T, E, C> {
+impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
     pub fn new(runner: &'a Runner<'a, T>, behaviors: &'b Behaviors<'b, E, Envelope<C>>) -> Self {
+        let ready_events = Rc::new(RefCell::new(VecDeque::new()));
+
         Self {
             runner,
             behaviors,
             current: runner.tree.nil(),
+            ready_events: ready_events.clone(),
+            consumers: vec![Box::new(EventOpConsumer::<E>::new(ready_events.clone()))],
         }
     }
 
     pub fn current(&self) -> State {
         self.current
+    }
+
+    pub fn add_consumer<Cn>(&mut self, consumer: Cn) -> &mut Self
+    where
+        Cn: OpConsumer + 'static,
+    {
+        self.consumers.push(Box::new(consumer));
+        self
+    }
+
+    pub fn remove_consumer(&mut self, index: usize) -> Option<Box<dyn OpConsumer>> {
+        if index < self.consumers.len() {
+            Some(self.consumers.remove(index))
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_consumers(&mut self) {
+        self.consumers.clear();
+    }
+}
+
+impl<C> Envelope<C> {
+    pub fn new(context: C) -> Self {
+        Self {
+            context,
+            reconciler: Reconciler::default(),
+        }
     }
 }
 
@@ -59,36 +98,38 @@ where
         context.reconciler.stage(EventOp::Emit(event), None);
     }
 
-    /// Commit reconciler and process all staged operations.
-    ///
-    /// - `EventOp::Emit`: dispatched through the runner (may stage more operations).
-    /// - Everything else: passed through `consumers` in order.
-    /// - Unconsumed operations fall through to `on_unhandled`.
-    ///
-    /// Repeats until no more `EventOp` is produced.
+    /// Commit staged operations, route them through the machine's consumers, and
+    /// dispatch resulting events until the machine becomes stable.
     pub fn advance(
         &mut self,
         context: &mut Envelope<C>,
         on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
     ) {
         loop {
-            // Collect EventOps from this commit round
-            let mut events = VecDeque::new();
-            context
-                .reconciler
-                .flush(|ticket, op| match Downcast::<EventOp<E>>::downcast(op) {
-                    Ok(event_op) => match *event_op {
-                        EventOp::Emit(e) => events.push_back(e),
-                    },
-                    Err(err) => on_unhandled(ticket, err.into_object()),
-                });
+            context.reconciler.commit(|ticket, op| {
+                let mut current = Some(op);
 
-            if events.is_empty() {
+                for consumer in self.consumers.iter_mut() {
+                    let Some(op) = current.take() else {
+                        break;
+                    };
+
+                    match consumer.as_mut().consume(ticket, op) {
+                        OpFlow::Consumed => break,
+                        OpFlow::Continue(op) => current = Some(op),
+                    }
+                }
+
+                if let Some(op) = current {
+                    on_unhandled(ticket, op);
+                }
+            });
+
+            if self.ready_events.borrow().is_empty() {
                 break;
             }
 
-            // Dispatch collected events (may stage new operations → next loop iteration)
-            while let Some(event) = events.pop_front() {
+            while let Some(event) = self.ready_events.borrow_mut().pop_front() {
                 self.current = self
                     .runner
                     .dispatch(self.behaviors, &self.current, &event, context);
@@ -216,10 +257,7 @@ mod tests {
         });
 
     fn new_envelope() -> Envelope<LightContext> {
-        Envelope {
-            context: LightContext { logs: Vec::new() },
-            reconciler: Reconciler::default(),
-        }
+        Envelope::new(LightContext { logs: Vec::new() })
     }
 
     fn new_machine() -> Machine<'static, 'static, &'static str, LightEvent, LightContext> {

@@ -1,10 +1,11 @@
 [package]
-name = "maokai-contracts"
+name = "maokai-gears"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 maokai-reconciler = { workspace = true }
+downcast = { workspace = true }
 
 [lints]
 workspace = true
