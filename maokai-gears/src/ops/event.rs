@@ -1,7 +1,7 @@
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::marker::PhantomData;
-use std::rc::Rc;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::rc::Rc;
+use core::cell::RefCell;
 use downcast::Downcast;
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Ticket};
 
@@ -17,15 +17,11 @@ pub type SharedEventQueue<E> = Rc<RefCell<VecDeque<E>>>;
 
 pub struct EventOpConsumer<E> {
     queue: SharedEventQueue<E>,
-    _marker: PhantomData<fn() -> E>,
 }
 
 impl<E> EventOpConsumer<E> {
     pub fn new(queue: SharedEventQueue<E>) -> Self {
-        Self {
-            queue,
-            _marker: PhantomData,
-        }
+        Self { queue }
     }
 }
 

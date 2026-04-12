@@ -1,6 +1,7 @@
+use alloc::boxed::Box;
 use downcast::Downcast;
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Ticket};
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskHandle(pub u64);
