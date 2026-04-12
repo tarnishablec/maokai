@@ -1,5 +1,5 @@
 [package]
-name = "maokai-mailbox"
+name = "maokai-machine"
 version = "0.1.0"
 edition = "2024"
 
@@ -12,7 +12,8 @@ tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync"]
 maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 maokai-reconciler = { workspace = true }
-async-trait = { workspace = true, features = [] }
+maokai-contracts = { workspace = true }
+downcast = { workspace = true }
 tokio = { workspace = true, optional = true, version = "1.0.0", features = ["time"] }
 
 [lints]

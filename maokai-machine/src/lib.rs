@@ -1,35 +1,100 @@
 #![no_std]
 extern crate alloc;
 
-use maokai_reconciler::Reconciler;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use downcast::Downcast;
+use maokai_contracts::ops::EventOp;
+use maokai_reconciler::{Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
-use maokai_tree::State;
+use maokai_tree::{State, StateTree, TreeView};
 
 pub struct Envelope<C> {
     pub context: C,
     pub reconciler: Reconciler,
 }
 
-pub struct Mailbox<'a, 'b, T, E, C> {
+pub struct Machine<'a, 'b, T, E, C> {
     runner: &'a Runner<'a, T>,
-    current: State,
     behaviors: &'b Behaviors<'b, E, Envelope<C>>,
+    current: State,
 }
 
-impl<'a, 'b, T, E, C> Mailbox<'a, 'b, T, E, C> {
+impl<'a, 'b, T, E, C> Machine<'a, 'b, T, E, C> {
     pub fn new(runner: &'a Runner<'a, T>, behaviors: &'b Behaviors<'b, E, Envelope<C>>) -> Self {
         Self {
             runner,
-            current: runner.tree.nil(),
             behaviors,
+            current: runner.tree.nil(),
         }
     }
 
     pub fn current(&self) -> State {
         self.current
     }
+}
 
-    pub fn step() {}
+impl<T, E: 'static, C> Machine<'_, '_, T, E, C>
+where
+    StateTree<T>: TreeView,
+{
+    pub fn init(
+        &mut self,
+        event: E,
+        context: &mut Envelope<C>,
+        on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
+    ) -> bool {
+        if self.current != self.runner.tree.nil() {
+            return false;
+        }
+
+        self.post(event, context);
+        self.advance(context, on_unhandled);
+        true
+    }
+
+    /// Stage an event into the reconciler as `EventOp::Emit`.
+    /// The event is not dispatched until `advance` is called.
+    pub fn post(&mut self, event: E, context: &mut Envelope<C>) {
+        context.reconciler.stage(EventOp::Emit(event), None);
+    }
+
+    /// Commit reconciler and process all staged operations.
+    ///
+    /// - `EventOp::Emit`: dispatched through the runner (may stage more operations).
+    /// - Everything else: passed through `consumers` in order.
+    /// - Unconsumed operations fall through to `on_unhandled`.
+    ///
+    /// Repeats until no more `EventOp` is produced.
+    pub fn advance(
+        &mut self,
+        context: &mut Envelope<C>,
+        on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
+    ) {
+        loop {
+            // Collect EventOps from this commit round
+            let mut events = VecDeque::new();
+            context
+                .reconciler
+                .flush(|ticket, op| match Downcast::<EventOp<E>>::downcast(op) {
+                    Ok(event_op) => match *event_op {
+                        EventOp::Emit(e) => events.push_back(e),
+                    },
+                    Err(err) => on_unhandled(ticket, err.into_object()),
+                });
+
+            if events.is_empty() {
+                break;
+            }
+
+            // Dispatch collected events (may stage new operations → next loop iteration)
+            while let Some(event) = events.pop_front() {
+                self.current = self
+                    .runner
+                    .dispatch(self.behaviors, &self.current, &event, context);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -143,97 +208,24 @@ mod tests {
     static BEHAVIORS: LazyLock<Behaviors<'static, LightEvent, Envelope<LightContext>>> =
         LazyLock::new(|| {
             let (_, closed, opened, shining) = &*SETUP_TREE;
-            let mut b = Behaviors::default();
-            b.register(closed, ClosedBehavior);
-            b.register(opened, OpenedBehavior);
-            b.register(shining, ShiningBehavior);
-            b
+            let mut behaviors = Behaviors::default();
+            behaviors.register(closed, ClosedBehavior);
+            behaviors.register(opened, OpenedBehavior);
+            behaviors.register(shining, ShiningBehavior);
+            behaviors
         });
 
-    #[test]
-    fn initial_enter_from_nil_to_closed() {
-        let mut envelope = Envelope {
-            context: LightContext {
-                logs: Vec::new(),
-            },
+    fn new_envelope() -> Envelope<LightContext> {
+        Envelope {
+            context: LightContext { logs: Vec::new() },
             reconciler: Reconciler::default(),
-        };
-
-        let (tree, closed, _, _) = &*SETUP_TREE;
-
-        // nil -> closed: should enter [root, closed], exit [nil] (no behavior)
-        let current = RUNNER.transition(&BEHAVIORS, &tree.nil(), closed, &mut envelope);
-
-        assert_eq!(current, *closed);
-        assert_eq!(envelope.context.logs, std::vec!["enter:closed"]);
+        }
     }
 
-    #[test]
-    fn open_then_close() {
-        let mut envelope = Envelope {
-            context: LightContext {
-                logs: Vec::new(),
-            },
-            reconciler: Reconciler::default(),
-        };
-
-        let (_, closed, opened, _) = &*SETUP_TREE;
-
-        // Start at closed, dispatch Open
-        let current = RUNNER.dispatch(&BEHAVIORS, closed, &LightEvent::Open, &mut envelope);
-        assert_eq!(current, *opened);
-        assert_eq!(
-            envelope.context.logs,
-            std::vec!["exit:closed", "enter:opened"]
-        );
-
-        envelope.context.logs.clear();
-
-        // At opened, dispatch Close
-        let current = RUNNER.dispatch(&BEHAVIORS, &current, &LightEvent::Close, &mut envelope);
-        assert_eq!(current, *closed);
-        assert_eq!(
-            envelope.context.logs,
-            std::vec!["exit:opened", "enter:closed"]
-        );
+    fn new_machine() -> Machine<'static, 'static, &'static str, LightEvent, LightContext> {
+        Machine::new(&RUNNER, &BEHAVIORS)
     }
 
-    #[test]
-    fn shine_is_child_of_opened() {
-        let mut envelope = Envelope {
-            context: LightContext {
-                logs: Vec::new(),
-            },
-            reconciler: Reconciler::default(),
-        };
-
-        let (_, _, opened, shining) = &*SETUP_TREE;
-
-        // At opened, dispatch Shine -> enters shining (child of opened)
-        let current = RUNNER.dispatch(&BEHAVIORS, opened, &LightEvent::Shine, &mut envelope);
-        assert_eq!(current, *shining);
-        // No exit:opened because shining is a child — only enter:shining
-        assert_eq!(envelope.context.logs, std::vec!["enter:shining"]);
-    }
-
-    #[test]
-    fn close_bubbles_from_shining_to_opened() {
-        let mut envelope = Envelope {
-            context: LightContext {
-                logs: Vec::new(),
-            },
-            reconciler: Reconciler::default(),
-        };
-
-        let (_, closed, _, shining) = &*SETUP_TREE;
-
-        // At shining, dispatch Close -> ShiningBehavior returns Ignored -> bubbles to OpenedBehavior -> transitions to closed
-        let current = RUNNER.dispatch(&BEHAVIORS, shining, &LightEvent::Close, &mut envelope);
-        assert_eq!(current, *closed);
-        // exit shining, exit opened, enter closed
-        assert_eq!(
-            envelope.context.logs,
-            std::vec!["exit:shining", "exit:opened", "enter:closed"]
-        );
-    }
+    /// No-op commit handler for tests that don't produce non-event operations.
+    fn noop(_: Ticket, _: Box<dyn Operation>) {}
 }

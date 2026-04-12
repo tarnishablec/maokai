@@ -26,12 +26,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb9e21e48c85fa6643a38caca564645a3bbc9211edf506fc8ed690c7e7b4d3c7"
 
 [[package]]
-name = "lazy_static"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
 name = "maokai-contracts"
 version = "0.1.0"
 dependencies = [
@@ -39,11 +33,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "maokai-mailbox"
+name = "maokai-machine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "lazy_static",
+ "downcast",
+ "maokai-contracts",
  "maokai-reconciler",
  "maokai-runner",
  "maokai-tree",
