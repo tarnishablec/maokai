@@ -13,6 +13,7 @@ async-trait = { version = "*", default-features = false }
 indextree = { version = "*", default-features = false }
 tokio = { version = "*", default-features = false }
 downcast = { version = "*" }
+slotmap = { version = "*", default-features = false }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

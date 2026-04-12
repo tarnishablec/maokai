@@ -6,11 +6,27 @@ use alloc::rc::Rc;
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
+use maokai_reconciler::Ticket;
 use tokio::task::{JoinHandle, spawn_local};
 
 use crate::ops::task::*;
 
 pub type LocalTask<O> = Pin<Box<dyn Future<Output = O> + 'static>>;
+
+pub trait LocalTaskOpsExt<O: 'static>: TaskOpsExt<LocalTask<O>> {
+    fn start_local_task<F>(&mut self, future: F) -> Option<TaskHandle>
+    where
+        F: Future<Output = O> + 'static,
+    {
+        self.start_task(Box::pin(future) as LocalTask<O>)
+    }
+
+    fn stop_local_task(&mut self, handle: TaskHandle) -> Option<Ticket> {
+        self.stop_task(handle)
+    }
+}
+
+impl<O: 'static, Ctx> LocalTaskOpsExt<O> for Ctx where Ctx: TaskOpsExt<LocalTask<O>> {}
 
 pub struct TokioLocalRuntime;
 
@@ -56,9 +72,11 @@ mod tests {
         local
             .run_until(async {
                 let mut runtime = TokioLocalRuntime;
-                let (sender, mut receiver) = <TokioLocalRuntime as TaskRuntime<LocalTask<i32>>>::create_channel(&runtime);
+                let (sender, mut receiver) =
+                    <TokioLocalRuntime as TaskRuntime<LocalTask<i32>>>::create_channel(&runtime);
 
-                let handle = TaskHandle::from_raw(0);
+                let mut handles = TaskHandles::default();
+                let handle = handles.alloc();
                 let task: LocalTask<i32> = Box::pin(async { 42 });
 
                 let join = runtime.start(handle, task, sender);
@@ -77,17 +95,17 @@ mod tests {
         local
             .run_until(async {
                 let mut runtime = TokioLocalRuntime;
-                let (sender, mut receiver) = <TokioLocalRuntime as TaskRuntime<LocalTask<()>>>::create_channel(&runtime);
+                let (sender, mut receiver) =
+                    <TokioLocalRuntime as TaskRuntime<LocalTask<()>>>::create_channel(&runtime);
 
-                let handle = TaskHandle::from_raw(0);
+                let mut handles = TaskHandles::default();
+                let handle = handles.alloc();
                 let task: LocalTask<()> = Box::pin(async {
                     tokio::time::sleep(std::time::Duration::from_secs(999)).await;
                 });
 
                 let join = runtime.start(handle, task, sender);
-                <TokioLocalRuntime as TaskRuntime<LocalTask<()>>>::stop(
-                    &mut runtime, handle, join,
-                );
+                <TokioLocalRuntime as TaskRuntime<LocalTask<()>>>::stop(&mut runtime, handle, join);
 
                 tokio::task::yield_now().await;
                 assert!(receiver.try_recv().is_none());

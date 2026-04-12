@@ -12,6 +12,7 @@ tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", 
 maokai-reconciler = { workspace = true }
 downcast = { workspace = true }
 tokio = { workspace = true, optional = true }
+slotmap = { workspace = true }
 
 [lints]
 workspace = true

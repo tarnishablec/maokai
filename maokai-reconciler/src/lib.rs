@@ -200,3 +200,7 @@ impl Reconciler {
         self.rules.clear();
     }
 }
+
+pub trait HasReconciler {
+    fn reconciler(&mut self) -> &mut Reconciler;
+}

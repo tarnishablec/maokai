@@ -9,13 +9,27 @@ use core::any::type_name;
 use core::cell::RefCell;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
+use maokai_gears::ops::task::{HasTaskHandles, TaskHandle, TaskHandles};
+use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
 pub struct Envelope<C> {
     pub context: C,
     pub reconciler: Reconciler,
+    task_handles: TaskHandles,
+}
+
+impl<C> HasReconciler for Envelope<C> {
+    fn reconciler(&mut self) -> &mut Reconciler {
+        &mut self.reconciler
+    }
+}
+
+impl<C> HasTaskHandles for Envelope<C> {
+    fn alloc_task_handle(&mut self) -> TaskHandle {
+        self.task_handles.alloc()
+    }
 }
 
 pub struct Machine<'a, 'b, T, E, C> {
@@ -77,6 +91,7 @@ impl<C> Envelope<C> {
         Self {
             context,
             reconciler: Reconciler::default(),
+            task_handles: TaskHandles::default(),
         }
     }
 }
@@ -388,13 +403,7 @@ mod tokio_local_tests {
     impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
             ctx.context.logs.push("enter:working");
-            ctx.reconciler.stage(
-                TaskOp::<LocalTask<&'static str>>::Start {
-                    handle: TaskHandle::from_raw(0),
-                    task: Box::pin(async { "result" }),
-                },
-                None,
-            );
+            let _ = ctx.start_local_task(async { "result" });
         }
         fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
             ctx.context.logs.push("exit:working");
@@ -536,13 +545,7 @@ mod tokio_mt_tests {
     impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
             ctx.context.logs.push("enter:working");
-            ctx.reconciler.stage(
-                TaskOp::<SendTask<&'static str>>::Start {
-                    handle: TaskHandle::from_raw(0),
-                    task: Box::pin(async { "result" }),
-                },
-                None,
-            );
+            let _ = ctx.start_send_task(async { "result" });
         }
         fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
             ctx.context.logs.push("exit:working");

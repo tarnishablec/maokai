@@ -3,12 +3,28 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::future::Future;
 use core::pin::Pin;
+use maokai_reconciler::Ticket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::ops::task::*;
 
 pub type SendTask<O> = Pin<Box<dyn Future<Output = O> + Send + 'static>>;
+
+pub trait SendTaskOpsExt<O: Send + 'static>: TaskOpsExt<SendTask<O>> {
+    fn start_send_task<F>(&mut self, future: F) -> Option<TaskHandle>
+    where
+        F: Future<Output = O> + Send + 'static,
+    {
+        self.start_task(Box::pin(future))
+    }
+
+    fn stop_send_task(&mut self, handle: TaskHandle) -> Option<Ticket> {
+        self.stop_task(handle)
+    }
+}
+
+impl<O: Send + 'static, Ctx> SendTaskOpsExt<O> for Ctx where Ctx: TaskOpsExt<SendTask<O>> {}
 
 impl<O: Send> CompletionSender<O> for mpsc::UnboundedSender<TaskCompletion<O>> {
     fn send(&self, completion: TaskCompletion<O>) {
@@ -65,7 +81,8 @@ mod tests {
         let (sender, mut receiver) =
             <TokioMtRuntime as TaskRuntime<SendTask<i32>>>::create_channel(&runtime);
 
-        let handle = TaskHandle::from_raw(0);
+        let mut handles = TaskHandles::default();
+        let handle = handles.alloc();
         let task: SendTask<i32> = Box::pin(async { 42 });
 
         let join = runtime.start(handle, task, sender);
@@ -82,7 +99,8 @@ mod tests {
         let (sender, mut receiver) =
             <TokioMtRuntime as TaskRuntime<SendTask<()>>>::create_channel(&runtime);
 
-        let handle = TaskHandle::from_raw(0);
+        let mut handles = TaskHandles::default();
+        let handle = handles.alloc();
         let task: SendTask<()> = Box::pin(async {
             tokio::time::sleep(std::time::Duration::from_secs(999)).await;
         });

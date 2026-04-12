@@ -3,19 +3,33 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::rc::Rc;
 use core::cell::RefCell;
 use downcast::Downcast;
-use maokai_reconciler::{OpConsumer, OpFlow, Operation, Ticket};
+use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Ticket};
+use slotmap::{SlotMap, new_key_type};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskHandle(u64);
+new_key_type! {
+    pub struct TaskHandle;
+}
 
-impl TaskHandle {
-    pub fn from_raw(id: u64) -> Self {
-        Self(id)
+pub struct TaskHandles {
+    handles: SlotMap<TaskHandle, ()>,
+}
+
+impl Default for TaskHandles {
+    fn default() -> Self {
+        Self {
+            handles: SlotMap::with_key(),
+        }
     }
+}
 
-    pub fn raw(self) -> u64 {
-        self.0
+impl TaskHandles {
+    pub fn alloc(&mut self) -> TaskHandle {
+        self.handles.insert(())
     }
+}
+
+pub trait HasTaskHandles {
+    fn alloc_task_handle(&mut self) -> TaskHandle;
 }
 
 pub enum TaskOp<T> {
@@ -24,6 +38,21 @@ pub enum TaskOp<T> {
 }
 
 impl<T: 'static> Operation for TaskOp<T> {}
+
+pub trait TaskOpsExt<T: 'static>: HasReconciler + HasTaskHandles {
+    fn start_task(&mut self, task: T) -> Option<TaskHandle> {
+        let handle = self.alloc_task_handle();
+        self.reconciler()
+            .stage(TaskOp::Start { handle, task }, None)
+            .map(|_| handle)
+    }
+
+    fn stop_task(&mut self, handle: TaskHandle) -> Option<Ticket> {
+        self.reconciler().stage(TaskOp::<T>::Stop(handle), None)
+    }
+}
+
+impl<T: 'static, Ctx> TaskOpsExt<T> for Ctx where Ctx: HasReconciler + HasTaskHandles {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompletion<O> {
@@ -77,7 +106,6 @@ where
     runtime: R,
     running: BTreeMap<TaskHandle, R::Running>,
     sender: R::Sender,
-    next_handle: u64,
 }
 
 impl<R, T> TaskOpConsumer<R, T>
@@ -90,15 +118,8 @@ where
             runtime,
             running: BTreeMap::new(),
             sender,
-            next_handle: 0,
         };
         (consumer, receiver)
-    }
-
-    pub fn next_handle(&mut self) -> TaskHandle {
-        let h = TaskHandle(self.next_handle);
-        self.next_handle += 1;
-        h
     }
 
     pub fn runtime(&self) -> &R {
