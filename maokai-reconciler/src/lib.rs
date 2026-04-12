@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::any::type_name;
+use core::any::{TypeId, type_name};
 use core::cmp::Ordering;
 use downcast::{Any, impl_downcast};
 
@@ -84,7 +84,7 @@ pub trait RuleAccess {
 #[derive(Default)]
 pub struct Reconciler {
     next_ticket: u32,
-    pub(crate) rules: Vec<Box<dyn Rule>>,
+    rules: Vec<(TypeId, Box<dyn Rule>)>,
     pub(crate) pending_ops: BTreeMap<Ticket, Box<dyn Operation>>,
 }
 
@@ -111,7 +111,7 @@ impl RuleAccess for Reconciler {
 }
 
 impl Reconciler {
-    pub(crate) fn next_ticket(&mut self, priority: u32) -> Ticket {
+    fn next_ticket(&mut self, priority: u32) -> Ticket {
         let ticket = Ticket(self.next_ticket, priority);
         self.next_ticket += 1;
         ticket
@@ -128,7 +128,7 @@ impl Reconciler {
         let mut keep = true;
 
         let rules = core::mem::take(&mut self.rules);
-        for rule in &rules {
+        for (_, rule) in &rules {
             let (flow, disposition) = rule.apply(ticket, incoming.as_mut(), self);
 
             match disposition {
@@ -173,20 +173,27 @@ impl Reconciler {
         }
     }
 
-    pub fn add_rule<R>(&mut self, rule: R) -> &mut Self
-    where
-        R: Rule + 'static,
-    {
-        self.rules.push(Box::new(rule));
+    pub fn add_rule<R: Rule + 'static>(&mut self, rule: R) -> &mut Self {
+        let type_id = TypeId::of::<R>();
+        if let Some(pos) = self.rules.iter().position(|(id, _)| *id == type_id) {
+            self.rules[pos] = (type_id, Box::new(rule));
+        } else {
+            self.rules.push((type_id, Box::new(rule)));
+        }
         self
     }
 
-    pub fn remove_rule(&mut self, index: usize) -> Option<Box<dyn Rule>> {
-        if index < self.rules.len() {
-            Some(self.rules.remove(index))
-        } else {
-            None
-        }
+    pub fn remove_rule<R: Rule + 'static>(&mut self) -> Option<Box<dyn Rule>> {
+        let type_id = TypeId::of::<R>();
+        self.rules
+            .iter()
+            .position(|(id, _)| *id == type_id)
+            .map(|pos| self.rules.remove(pos).1)
+    }
+
+    pub fn has_rule<R: Rule + 'static>(&self) -> bool {
+        let type_id = TypeId::of::<R>();
+        self.rules.iter().any(|(id, _)| *id == type_id)
     }
 
     pub fn clear_rules(&mut self) {
