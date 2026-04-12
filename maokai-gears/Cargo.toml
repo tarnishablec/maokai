@@ -3,9 +3,15 @@ name = "maokai-gears"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+tokio-local = ["dep:tokio", "tokio/rt", "tokio/macros", "tokio/time"]
+tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", "tokio/time"]
+
 [dependencies]
 maokai-reconciler = { workspace = true }
 downcast = { workspace = true }
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true

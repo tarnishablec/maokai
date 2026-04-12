@@ -268,4 +268,351 @@ mod tests {
 
     /// No-op commit handler for tests that don't produce non-event operations.
     fn noop(_: Ticket, _: Box<dyn Operation>) {}
+
+    // --- Basic Machine tests ---
+
+    #[test]
+    fn init_transitions_from_nil() {
+        let mut machine = new_machine();
+        let mut envelope = new_envelope();
+
+        let (_, closed, _, _) = &*SETUP_TREE;
+        machine.current = *closed;
+
+        machine.post(LightEvent::Open, &mut envelope);
+        machine.advance(&mut envelope, &mut noop);
+
+        let (_, _, opened, _) = &*SETUP_TREE;
+        assert_eq!(machine.current(), *opened);
+        assert_eq!(
+            envelope.context.logs,
+            alloc::vec!["exit:closed", "enter:opened"]
+        );
+    }
+
+    #[test]
+    fn event_bubbles_from_child_to_parent() {
+        let mut machine = new_machine();
+        let mut envelope = new_envelope();
+
+        let (_, _, _, shining) = &*SETUP_TREE;
+        machine.current = *shining;
+
+        // Close is Ignored by ShiningBehavior → bubbles to OpenedBehavior → Transition(closed)
+        machine.post(LightEvent::Close, &mut envelope);
+        machine.advance(&mut envelope, &mut noop);
+
+        let (_, closed, _, _) = &*SETUP_TREE;
+        assert_eq!(machine.current(), *closed);
+        assert_eq!(
+            envelope.context.logs,
+            alloc::vec!["exit:shining", "exit:opened", "enter:closed"]
+        );
+    }
+
+    #[test]
+    fn shine_transitions_into_child_state() {
+        let mut machine = new_machine();
+        let mut envelope = new_envelope();
+
+        let (_, _, opened, shining) = &*SETUP_TREE;
+        machine.current = *opened;
+
+        machine.post(LightEvent::Shine, &mut envelope);
+        machine.advance(&mut envelope, &mut noop);
+
+        assert_eq!(machine.current(), *shining);
+        assert_eq!(envelope.context.logs, alloc::vec!["enter:shining"]);
+    }
+}
+
+// --- Tokio LocalSet integration tests ---
+
+#[cfg(all(test, feature = "tokio-local"))]
+mod tokio_local_tests {
+    #![allow(clippy::unwrap_used)]
+    extern crate std;
+
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use maokai_gears::ops::task::*;
+    use maokai_gears::runtime::tokio_local::*;
+    use maokai_runner::{Behavior, EventReply, Transition};
+    use maokai_tree::StateTree;
+    use std::sync::LazyLock;
+
+    #[derive(Debug)]
+    enum Ev {
+        Go,
+        TaskDone,
+    }
+
+    struct Ctx {
+        logs: Vec<&'static str>,
+    }
+
+    static TREE: LazyLock<(StateTree<&str>, State, State)> = LazyLock::new(|| {
+        let mut tree = StateTree::new("root");
+        let idle = tree.add_child(&tree.root(), "idle");
+        let working = tree.add_child(&tree.root(), "working");
+        (tree, idle, working)
+    });
+
+    static RUNNER: LazyLock<Runner<&'static str>> = LazyLock::new(|| Runner::new(&TREE.0));
+
+    struct IdleBehavior;
+    struct WorkingBehavior;
+
+    impl Behavior<Ev, Envelope<Ctx>> for IdleBehavior {
+        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("enter:idle");
+        }
+        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("exit:idle");
+        }
+        fn on_event(
+            &self,
+            event: &Ev,
+            _: &State,
+            _: &mut Envelope<Ctx>,
+            _: &dyn TreeView,
+        ) -> EventReply {
+            match event {
+                Ev::Go => EventReply::Transition(TREE.2),
+                _ => EventReply::Ignored,
+            }
+        }
+    }
+
+    impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
+        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("enter:working");
+            ctx.reconciler.stage(
+                TaskOp::<LocalTask<&'static str>>::Start {
+                    handle: TaskHandle::from_raw(0),
+                    task: Box::pin(async { "result" }),
+                },
+                None,
+            );
+        }
+        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("exit:working");
+        }
+        fn on_event(
+            &self,
+            event: &Ev,
+            _: &State,
+            ctx: &mut Envelope<Ctx>,
+            _: &dyn TreeView,
+        ) -> EventReply {
+            match event {
+                Ev::TaskDone => {
+                    ctx.context.logs.push("task:done");
+                    EventReply::Transition(TREE.1)
+                }
+                _ => EventReply::Ignored,
+            }
+        }
+    }
+
+    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ctx>>> = LazyLock::new(|| {
+        let (_, idle, working) = &*TREE;
+        let mut b = Behaviors::default();
+        b.register(idle, IdleBehavior);
+        b.register(working, WorkingBehavior);
+        b
+    });
+
+    fn noop(_: Ticket, _: Box<dyn Operation>) {}
+
+    #[tokio::test]
+    async fn task_spawns_on_enter_and_completion_feeds_back() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
+                let mut envelope = Envelope::new(Ctx { logs: Vec::new() });
+
+                let (consumer, mut task_rx) = TaskOpConsumer::new(TokioLocalRuntime);
+                machine.set_consumer::<TaskOp<LocalTask<&'static str>>, _>(consumer);
+
+                // Start from idle
+                let (_, idle, working) = &*TREE;
+                machine.current = *idle;
+
+                // Go → working, on_enter stages TaskOp
+                machine.post(Ev::Go, &mut envelope);
+                machine.advance(&mut envelope, &mut noop);
+                assert_eq!(machine.current(), *working);
+
+                // Yield to let spawned local task complete
+                tokio::task::yield_now().await;
+
+                // Drain completion
+                let completion: TaskCompletion<&'static str> =
+                    CompletionReceiver::try_recv(&mut task_rx).unwrap();
+                assert_eq!(completion.output, "result");
+
+                // Feed back → transition to idle
+                machine.post(Ev::TaskDone, &mut envelope);
+                machine.advance(&mut envelope, &mut noop);
+                assert_eq!(machine.current(), *idle);
+
+                assert_eq!(
+                    envelope.context.logs,
+                    vec![
+                        "exit:idle",
+                        "enter:working",
+                        "task:done",
+                        "exit:working",
+                        "enter:idle"
+                    ]
+                );
+            })
+            .await;
+    }
+}
+
+// --- Tokio multi-thread integration tests ---
+
+#[cfg(all(test, feature = "tokio-mt"))]
+mod tokio_mt_tests {
+    #![allow(clippy::unwrap_used)]
+    extern crate std;
+
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use maokai_gears::ops::task::*;
+    use maokai_gears::runtime::tokio_mt::*;
+    use maokai_runner::{Behavior, EventReply, Transition};
+    use maokai_tree::StateTree;
+    use std::sync::LazyLock;
+
+    #[derive(Debug)]
+    enum Ev {
+        Go,
+        TaskDone,
+    }
+
+    struct Ctx {
+        logs: Vec<&'static str>,
+    }
+
+    static TREE: LazyLock<(StateTree<&str>, State, State)> = LazyLock::new(|| {
+        let mut tree = StateTree::new("root");
+        let idle = tree.add_child(&tree.root(), "idle");
+        let working = tree.add_child(&tree.root(), "working");
+        (tree, idle, working)
+    });
+
+    static RUNNER: LazyLock<Runner<&'static str>> = LazyLock::new(|| Runner::new(&TREE.0));
+
+    struct IdleBehavior;
+    struct WorkingBehavior;
+
+    impl Behavior<Ev, Envelope<Ctx>> for IdleBehavior {
+        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("enter:idle");
+        }
+        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("exit:idle");
+        }
+        fn on_event(
+            &self,
+            event: &Ev,
+            _: &State,
+            _: &mut Envelope<Ctx>,
+            _: &dyn TreeView,
+        ) -> EventReply {
+            match event {
+                Ev::Go => EventReply::Transition(TREE.2),
+                _ => EventReply::Ignored,
+            }
+        }
+    }
+
+    impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
+        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("enter:working");
+            ctx.reconciler.stage(
+                TaskOp::<SendTask<&'static str>>::Start {
+                    handle: TaskHandle::from_raw(0),
+                    task: Box::pin(async { "result" }),
+                },
+                None,
+            );
+        }
+        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
+            ctx.context.logs.push("exit:working");
+        }
+        fn on_event(
+            &self,
+            event: &Ev,
+            _: &State,
+            ctx: &mut Envelope<Ctx>,
+            _: &dyn TreeView,
+        ) -> EventReply {
+            match event {
+                Ev::TaskDone => {
+                    ctx.context.logs.push("task:done");
+                    EventReply::Transition(TREE.1)
+                }
+                _ => EventReply::Ignored,
+            }
+        }
+    }
+
+    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ctx>>> = LazyLock::new(|| {
+        let (_, idle, working) = &*TREE;
+        let mut b = Behaviors::default();
+        b.register(idle, IdleBehavior);
+        b.register(working, WorkingBehavior);
+        b
+    });
+
+    fn noop(_: Ticket, _: Box<dyn Operation>) {}
+
+    #[tokio::test]
+    async fn task_spawns_on_enter_and_completion_feeds_back() {
+        let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
+        let mut context = Envelope::new(Ctx { logs: Vec::new() });
+
+        let (consumer, mut task_rx) = TaskOpConsumer::new(TokioMtRuntime);
+        machine.set_consumer::<TaskOp<SendTask<&'static str>>, _>(consumer);
+
+        // Start from idle
+        let (_, idle, working) = &*TREE;
+        machine.current = *idle;
+
+        // Go → working, on_enter stages TaskOp
+        machine.post(Ev::Go, &mut context);
+        machine.advance(&mut context, &mut noop);
+        assert_eq!(machine.current(), *working);
+
+        // Wait for spawned task to complete on worker thread
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Drain completion via channel
+        let completion: TaskCompletion<&'static str> =
+            CompletionReceiver::try_recv(&mut task_rx).unwrap();
+        assert_eq!(completion.output, "result");
+
+        // Feed back → transition to idle
+        machine.post(Ev::TaskDone, &mut context);
+        machine.advance(&mut context, &mut noop);
+        assert_eq!(machine.current(), *idle);
+
+        assert_eq!(
+            context.context.logs,
+            vec![
+                "exit:idle",
+                "enter:working",
+                "task:done",
+                "exit:working",
+                "enter:idle"
+            ]
+        );
+    }
 }

@@ -5,15 +5,15 @@ edition = "2024"
 
 [features]
 default = []
-tokio-local = ["dep:tokio", "tokio/rt", "tokio/sync"]
-tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync"]
+tokio-local = ["dep:tokio", "tokio/rt", "tokio/macros", "tokio/time", "maokai-gears/tokio-local"]
+tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", "tokio/time", "maokai-gears/tokio-mt"]
 
 [dependencies]
 maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 maokai-reconciler = { workspace = true }
 maokai-gears = { workspace = true }
-tokio = { workspace = true, optional = true, version = "1.0.0", features = ["time"] }
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true
