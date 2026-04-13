@@ -165,6 +165,10 @@ impl Reconciler {
         self.pending_ops.clear();
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
     pub fn commit(&mut self, mut apply: impl FnMut(Ticket, Box<dyn Operation>)) {
         let pending = core::mem::take(&mut self.pending_ops);
 

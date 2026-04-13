@@ -10,6 +10,12 @@ use tokio::task::JoinHandle;
 use crate::ops::task::*;
 
 pub type SendTask<O> = Pin<Box<dyn Future<Output = O> + Send + 'static>>;
+pub type SendTaskCompletionSender<O> = mpsc::UnboundedSender<TaskCompletion<O>>;
+pub type SendTaskCompletionSource<O> = mpsc::UnboundedReceiver<TaskCompletion<O>>;
+
+pub fn completion_channel<O>() -> (SendTaskCompletionSender<O>, SendTaskCompletionSource<O>) {
+    mpsc::unbounded_channel()
+}
 
 pub trait SendTaskOpsExt<O: Send + 'static>: TaskOpsExt<SendTask<O>> {
     fn start_send_task<F>(&mut self, future: F) -> Option<TaskHandle>
@@ -26,13 +32,13 @@ pub trait SendTaskOpsExt<O: Send + 'static>: TaskOpsExt<SendTask<O>> {
 
 impl<O: Send + 'static, Ctx> SendTaskOpsExt<O> for Ctx where Ctx: TaskOpsExt<SendTask<O>> {}
 
-impl<O: Send> CompletionSender<O> for mpsc::UnboundedSender<TaskCompletion<O>> {
+impl<O: Send> TaskCompletionSender<O> for mpsc::UnboundedSender<TaskCompletion<O>> {
     fn send(&self, completion: TaskCompletion<O>) {
         let _ = mpsc::UnboundedSender::send(self, completion);
     }
 }
 
-impl<O> CompletionReceiver<O> for mpsc::UnboundedReceiver<TaskCompletion<O>> {
+impl<O> TaskCompletionSource<O> for mpsc::UnboundedReceiver<TaskCompletion<O>> {
     fn try_recv(&mut self) -> Option<TaskCompletion<O>> {
         mpsc::UnboundedReceiver::try_recv(self).ok()
     }
@@ -43,12 +49,7 @@ pub struct TokioMtRuntime;
 impl<O: Send + 'static> TaskRuntime<SendTask<O>> for TokioMtRuntime {
     type Running = JoinHandle<()>;
     type Output = O;
-    type Sender = mpsc::UnboundedSender<TaskCompletion<O>>;
-    type Receiver = mpsc::UnboundedReceiver<TaskCompletion<O>>;
-
-    fn create_channel(&self) -> (Self::Sender, Self::Receiver) {
-        mpsc::unbounded_channel()
-    }
+    type Sender = SendTaskCompletionSender<O>;
 
     fn start(
         &mut self,
@@ -58,7 +59,7 @@ impl<O: Send + 'static> TaskRuntime<SendTask<O>> for TokioMtRuntime {
     ) -> Self::Running {
         tokio::spawn(async move {
             let output = task.await;
-            CompletionSender::send(&sender, TaskCompletion { handle, output });
+            TaskCompletionSender::send(&sender, TaskCompletion { handle, output });
         })
     }
 
@@ -78,8 +79,7 @@ mod tests {
     #[tokio::test]
     async fn mt_task_completes() {
         let mut runtime = TokioMtRuntime;
-        let (sender, mut receiver) =
-            <TokioMtRuntime as TaskRuntime<SendTask<i32>>>::create_channel(&runtime);
+        let (sender, mut receiver) = completion_channel();
 
         let mut handles = TaskHandles::default();
         let handle = handles.alloc();
@@ -88,16 +88,15 @@ mod tests {
         let join = runtime.start(handle, task, sender);
         join.await.unwrap();
 
-        let completion = CompletionReceiver::try_recv(&mut receiver).unwrap();
+        let completion = TaskCompletionSource::try_recv(&mut receiver).unwrap();
         assert_eq!(completion.output, 42);
-        assert!(CompletionReceiver::try_recv(&mut receiver).is_none());
+        assert!(TaskCompletionSource::try_recv(&mut receiver).is_none());
     }
 
     #[tokio::test]
     async fn mt_task_abort() {
         let mut runtime = TokioMtRuntime;
-        let (sender, mut receiver) =
-            <TokioMtRuntime as TaskRuntime<SendTask<()>>>::create_channel(&runtime);
+        let (sender, mut receiver) = completion_channel();
 
         let mut handles = TaskHandles::default();
         let handle = handles.alloc();
@@ -109,6 +108,6 @@ mod tests {
         <TokioMtRuntime as TaskRuntime<SendTask<()>>>::stop(&mut runtime, handle, join);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(CompletionReceiver::<()>::try_recv(&mut receiver).is_none());
+        assert!(TaskCompletionSource::<()>::try_recv(&mut receiver).is_none());
     }
 }

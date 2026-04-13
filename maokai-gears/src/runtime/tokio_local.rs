@@ -12,6 +12,12 @@ use tokio::task::{JoinHandle, spawn_local};
 use crate::ops::task::*;
 
 pub type LocalTask<O> = Pin<Box<dyn Future<Output = O> + 'static>>;
+pub type LocalTaskCompletionQueue<O> = Rc<RefCell<VecDeque<TaskCompletion<O>>>>;
+
+pub fn completion_channel<O>() -> (LocalTaskCompletionQueue<O>, LocalTaskCompletionQueue<O>) {
+    let q = Rc::new(RefCell::new(VecDeque::new()));
+    (q.clone(), q)
+}
 
 pub trait LocalTaskOpsExt<O: 'static>: TaskOpsExt<LocalTask<O>> {
     fn start_local_task<F>(&mut self, future: F) -> Option<TaskHandle>
@@ -33,13 +39,7 @@ pub struct TokioLocalRuntime;
 impl<O: 'static> TaskRuntime<LocalTask<O>> for TokioLocalRuntime {
     type Running = JoinHandle<()>;
     type Output = O;
-    type Sender = Rc<RefCell<VecDeque<TaskCompletion<O>>>>;
-    type Receiver = Rc<RefCell<VecDeque<TaskCompletion<O>>>>;
-
-    fn create_channel(&self) -> (Self::Sender, Self::Receiver) {
-        let q = Rc::new(RefCell::new(VecDeque::new()));
-        (q.clone(), q)
-    }
+    type Sender = LocalTaskCompletionQueue<O>;
 
     fn start(
         &mut self,
@@ -49,7 +49,7 @@ impl<O: 'static> TaskRuntime<LocalTask<O>> for TokioLocalRuntime {
     ) -> Self::Running {
         spawn_local(async move {
             let output = task.await;
-            CompletionSender::send(&sender, TaskCompletion { handle, output });
+            TaskCompletionSender::send(&sender, TaskCompletion { handle, output });
         })
     }
 
@@ -72,8 +72,7 @@ mod tests {
         local
             .run_until(async {
                 let mut runtime = TokioLocalRuntime;
-                let (sender, mut receiver) =
-                    <TokioLocalRuntime as TaskRuntime<LocalTask<i32>>>::create_channel(&runtime);
+                let (sender, mut receiver) = completion_channel();
 
                 let mut handles = TaskHandles::default();
                 let handle = handles.alloc();
@@ -95,8 +94,7 @@ mod tests {
         local
             .run_until(async {
                 let mut runtime = TokioLocalRuntime;
-                let (sender, mut receiver) =
-                    <TokioLocalRuntime as TaskRuntime<LocalTask<()>>>::create_channel(&runtime);
+                let (sender, mut receiver) = completion_channel();
 
                 let mut handles = TaskHandles::default();
                 let handle = handles.alloc();

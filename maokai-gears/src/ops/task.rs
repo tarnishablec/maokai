@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use core::marker::PhantomData;
 use downcast::Downcast;
 use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Ticket};
 use slotmap::{SlotMap, new_key_type};
@@ -60,27 +61,83 @@ pub struct TaskCompletion<O> {
     pub output: O,
 }
 
+pub struct TaskCompletionOp<O>(pub TaskCompletion<O>);
+
+impl<O: 'static> Operation for TaskCompletionOp<O> {}
+
 // --- Completion channel abstraction ---
 
-pub trait CompletionSender<O>: Clone {
+pub trait TaskCompletionSender<O>: Clone {
     fn send(&self, completion: TaskCompletion<O>);
 }
 
-pub trait CompletionReceiver<O> {
+pub trait TaskCompletionSource<O> {
     fn try_recv(&mut self) -> Option<TaskCompletion<O>>;
+}
+
+pub trait CompletionSourceProvider {
+    fn register_completion_source<O, S>(&mut self, source: S)
+    where
+        O: 'static,
+        S: TaskCompletionSource<O> + 'static;
+}
+
+pub trait ConsumerProvider {
+    fn register_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
+    where
+        O: Operation + 'static,
+        Cn: OpConsumer + 'static;
+}
+
+pub fn install_task_runtime<M, Op, O, Cn, S>(machine: &mut M, consumer: Cn, source: S)
+where
+    M: ConsumerProvider + CompletionSourceProvider,
+    Op: Operation + 'static,
+    O: 'static,
+    Cn: OpConsumer + 'static,
+    S: TaskCompletionSource<O> + 'static,
+{
+    let _ = machine.register_consumer::<Op, Cn>(consumer);
+    machine.register_completion_source::<O, S>(source);
 }
 
 // Local channel: Rc<RefCell<VecDeque>> serves as both sender and receiver.
 
-impl<O> CompletionSender<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
+impl<O> TaskCompletionSender<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
     fn send(&self, completion: TaskCompletion<O>) {
         self.borrow_mut().push_back(completion);
     }
 }
 
-impl<O> CompletionReceiver<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
+impl<O> TaskCompletionSource<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
     fn try_recv(&mut self) -> Option<TaskCompletion<O>> {
         self.borrow_mut().pop_front()
+    }
+}
+
+pub struct TaskCompletionConsumer<O, F> {
+    map: F,
+    _marker: PhantomData<fn(O)>,
+}
+
+impl<O, F> TaskCompletionConsumer<O, F> {
+    pub fn new(map: F) -> Self {
+        Self {
+            map,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<O: 'static, F> OpConsumer for TaskCompletionConsumer<O, F>
+where
+    F: FnMut(TaskCompletion<O>) -> OpFlow,
+{
+    fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
+        match Downcast::<TaskCompletionOp<O>>::downcast(op) {
+            Ok(completion) => (self.map)(completion.0),
+            Err(err) => OpFlow::Continue(err.into_object()),
+        }
     }
 }
 
@@ -89,10 +146,9 @@ impl<O> CompletionReceiver<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
 pub trait TaskRuntime<T> {
     type Running;
     type Output;
-    type Sender: CompletionSender<Self::Output>;
-    type Receiver: CompletionReceiver<Self::Output>;
 
-    fn create_channel(&self) -> (Self::Sender, Self::Receiver);
+    type Sender: TaskCompletionSender<Self::Output>;
+
     fn start(&mut self, handle: TaskHandle, task: T, sender: Self::Sender) -> Self::Running;
     fn stop(&mut self, handle: TaskHandle, running: Self::Running);
 }
@@ -112,14 +168,12 @@ impl<R, T> TaskOpConsumer<R, T>
 where
     R: TaskRuntime<T>,
 {
-    pub fn new(runtime: R) -> (Self, R::Receiver) {
-        let (sender, receiver) = runtime.create_channel();
-        let consumer = Self {
+    pub fn new(runtime: R, sender: R::Sender) -> Self {
+        Self {
             runtime,
             running: BTreeMap::new(),
             sender,
-        };
-        (consumer, receiver)
+        }
     }
 
     pub fn runtime(&self) -> &R {

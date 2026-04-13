@@ -5,11 +5,27 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 use core::any::type_name;
 use core::cell::RefCell;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_gears::ops::task::{TaskSpawner, TaskHandle, TaskHandles};
+#[cfg(any(feature = "tokio-local", feature = "tokio-mt"))]
+use maokai_gears::ops::task::install_task_runtime;
+use maokai_gears::ops::task::{
+    CompletionSourceProvider, ConsumerProvider, TaskCompletionOp, TaskCompletionSource, TaskHandle,
+    TaskHandles, TaskSpawner,
+};
+#[cfg(any(feature = "tokio-local", feature = "tokio-mt"))]
+use maokai_gears::ops::task::{TaskOp, TaskOpConsumer};
+#[cfg(feature = "tokio-local")]
+use maokai_gears::runtime::tokio_local::completion_channel as local_completion_channel;
+#[cfg(feature = "tokio-local")]
+use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalRuntime};
+#[cfg(feature = "tokio-mt")]
+use maokai_gears::runtime::tokio_mt::completion_channel as mt_completion_channel;
+#[cfg(feature = "tokio-mt")]
+use maokai_gears::runtime::tokio_mt::{SendTask, TokioMtRuntime};
 use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
@@ -38,6 +54,8 @@ pub struct Machine<'a, 'b, T, E, C> {
     current: State,
     ready_events: SharedEventQueue<E>,
     consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
+    #[allow(clippy::type_complexity)]
+    completion_sources: Vec<Box<dyn FnMut(&mut Reconciler) -> bool>>,
 }
 
 impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
@@ -55,6 +73,7 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
             current: runner.tree.nil(),
             ready_events: ready_events.clone(),
             consumers,
+            completion_sources: Vec::new(),
         }
     }
 
@@ -67,7 +86,7 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
         O: Operation + 'static,
         Cn: OpConsumer + 'static,
     {
-        self.consumers.insert(type_name::<O>(), Box::new(consumer))
+        <Self as ConsumerProvider>::register_consumer::<O, Cn>(self, consumer)
     }
 
     pub fn remove_consumer<O>(&mut self) -> Option<Box<dyn OpConsumer>>
@@ -83,6 +102,64 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
             type_name::<EventOp<E>>(),
             Box::new(EventOpConsumer::<E>::new(self.ready_events.clone())),
         );
+    }
+
+    pub fn attach_completion_source<O, S>(&mut self, source: S)
+    where
+        O: 'static,
+        S: TaskCompletionSource<O> + 'static,
+    {
+        <Self as CompletionSourceProvider>::register_completion_source::<O, S>(self, source)
+    }
+
+    #[cfg(feature = "tokio-local")]
+    pub fn install_tokio_local_tasks<O: 'static>(&mut self) {
+        let (sender, source) = local_completion_channel();
+        install_task_runtime::<Self, TaskOp<LocalTask<O>>, O, _, _>(
+            self,
+            TaskOpConsumer::new(TokioLocalRuntime, sender),
+            source,
+        );
+    }
+
+    #[cfg(feature = "tokio-mt")]
+    pub fn install_tokio_mt_tasks<O: Send + 'static>(&mut self) {
+        let (sender, source) = mt_completion_channel();
+        install_task_runtime::<Self, TaskOp<SendTask<O>>, O, _, _>(
+            self,
+            TaskOpConsumer::new(TokioMtRuntime, sender),
+            source,
+        );
+    }
+}
+
+impl<'a, 'b, T, E, C> ConsumerProvider for Machine<'a, 'b, T, E, C> {
+    fn register_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
+    where
+        O: Operation + 'static,
+        Cn: OpConsumer + 'static,
+    {
+        self.consumers.insert(type_name::<O>(), Box::new(consumer))
+    }
+}
+
+impl<'a, 'b, T, E, C> CompletionSourceProvider for Machine<'a, 'b, T, E, C> {
+    fn register_completion_source<O, S>(&mut self, source: S)
+    where
+        O: 'static,
+        S: TaskCompletionSource<O> + 'static,
+    {
+        let mut source = source;
+        self.completion_sources.push(Box::new(move |reconciler| {
+            let mut drained_any = false;
+
+            while let Some(completion) = source.try_recv() {
+                drained_any = true;
+                let _ = reconciler.stage(TaskCompletionOp(completion), None);
+            }
+
+            drained_any
+        }));
     }
 }
 
@@ -110,9 +187,9 @@ where
             return false;
         }
 
-        self.current =
-            self.runner
-                .transition(self.behaviors, &self.current, &target, context);
+        self.current = self
+            .runner
+            .transition(self.behaviors, &self.current, &target, context);
         self.advance(context, on_unhandled);
         true
     }
@@ -131,27 +208,43 @@ where
         on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
     ) {
         loop {
-            context.reconciler.commit(|ticket, op| {
-                let key = op.operation_key();
+            while context.reconciler.has_pending() {
+                context.reconciler.commit(|ticket, mut op| {
+                    loop {
+                        let key = op.operation_key();
 
-                if let Some(consumer) = self.consumers.get_mut(key) {
-                    match consumer.as_mut().consume(ticket, op) {
-                        OpFlow::Consumed => {}
-                        OpFlow::Continue(op) => on_unhandled(ticket, op),
+                        if let Some(consumer) = self.consumers.get_mut(key) {
+                            match consumer.as_mut().consume(ticket, op) {
+                                OpFlow::Consumed => return,
+                                OpFlow::Continue(next) => op = next,
+                            }
+                        } else {
+                            on_unhandled(ticket, op);
+                            return;
+                        }
                     }
-                } else {
-                    on_unhandled(ticket, op);
-                }
-            });
+                });
+            }
 
-            if self.ready_events.borrow().is_empty() {
-                break;
+            let mut drained_any = false;
+            for source in &mut self.completion_sources {
+                if source(&mut context.reconciler) {
+                    drained_any = true;
+                }
+            }
+
+            if drained_any {
+                continue;
             }
 
             while let Some(event) = self.ready_events.borrow_mut().pop_front() {
                 self.current = self
                     .runner
                     .dispatch(self.behaviors, &self.current, &event, context);
+            }
+
+            if !context.reconciler.has_pending() && self.ready_events.borrow().is_empty() {
+                break;
             }
         }
     }
@@ -298,7 +391,6 @@ mod tests {
         assert_eq!(machine.current(), *closed);
         assert_eq!(envelope.context.logs, alloc::vec!["enter:closed"]);
 
-        // Now post Open → transition to opened
         machine.post(LightEvent::Open, &mut envelope);
         machine.advance(&mut envelope, &mut noop);
 
@@ -318,7 +410,7 @@ mod tests {
         let (_, _, _, shining) = &*SETUP_TREE;
         machine.init(*shining, &mut envelope, &mut noop);
 
-        // Close is Ignored by ShiningBehavior → bubbles to OpenedBehavior → Transition(closed)
+        // Close is Ignored by ShiningBehavior 鈫?bubbles to OpenedBehavior 鈫?Transition(closed)
         machine.post(LightEvent::Close, &mut envelope);
         machine.advance(&mut envelope, &mut noop);
 
@@ -365,8 +457,9 @@ mod tokio_local_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use maokai_gears::ops::task::*;
-    use maokai_gears::runtime::tokio_local::*;
+    use maokai_gears::ops::EventOp;
+    use maokai_gears::ops::task::{TaskCompletion, TaskCompletionConsumer, TaskCompletionOp};
+    use maokai_gears::runtime::tokio_local::LocalTaskOpsExt;
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -457,28 +550,26 @@ mod tokio_local_tests {
                 let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
                 let mut envelope = Envelope::new(Ctx { logs: Vec::new() });
 
-                let (consumer, mut task_rx) = TaskOpConsumer::new(TokioLocalRuntime);
-                machine.set_consumer::<TaskOp<LocalTask<&'static str>>, _>(consumer);
+                machine.install_tokio_local_tasks::<&'static str>();
+                machine.set_consumer::<TaskCompletionOp<&'static str>, _>(
+                    TaskCompletionConsumer::new(|completion: TaskCompletion<&'static str>| {
+                        assert_eq!(completion.output, "result");
+                        OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
+                    }),
+                );
 
                 let (_, idle, working) = &*TREE;
                 machine.init(*idle, &mut envelope, &mut noop);
                 assert_eq!(machine.current(), *idle);
 
-                // Go → working, on_enter stages TaskOp
+                // Go 鈫?working, on_enter stages TaskOp
                 machine.post(Ev::Go, &mut envelope);
                 machine.advance(&mut envelope, &mut noop);
                 assert_eq!(machine.current(), *working);
 
-                // Yield to let spawned local task complete
+                // Yield to let spawned local task complete and let the machine drain it.
                 tokio::task::yield_now().await;
 
-                // Drain completion
-                let completion: TaskCompletion<&'static str> =
-                    CompletionReceiver::try_recv(&mut task_rx).unwrap();
-                assert_eq!(completion.output, "result");
-
-                // Feed back → transition to idle
-                machine.post(Ev::TaskDone, &mut envelope);
                 machine.advance(&mut envelope, &mut noop);
                 assert_eq!(machine.current(), *idle);
 
@@ -508,8 +599,9 @@ mod tokio_mt_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use maokai_gears::ops::task::*;
-    use maokai_gears::runtime::tokio_mt::*;
+    use maokai_gears::ops::EventOp;
+    use maokai_gears::ops::task::{TaskCompletion, TaskCompletionConsumer, TaskCompletionOp};
+    use maokai_gears::runtime::tokio_mt::SendTaskOpsExt;
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -597,28 +689,25 @@ mod tokio_mt_tests {
         let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
         let mut context = Envelope::new(Ctx { logs: Vec::new() });
 
-        let (consumer, mut task_rx) = TaskOpConsumer::new(TokioMtRuntime);
-        machine.set_consumer::<TaskOp<SendTask<&'static str>>, _>(consumer);
+        machine.install_tokio_mt_tasks::<&'static str>();
+        machine.set_consumer::<TaskCompletionOp<&'static str>, _>(TaskCompletionConsumer::new(
+            |completion: TaskCompletion<&'static str>| {
+                assert_eq!(completion.output, "result");
+                OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
+            },
+        ));
 
         let (_, idle, working) = &*TREE;
         machine.init(*idle, &mut context, &mut noop);
         assert_eq!(machine.current(), *idle);
 
-        // Go → working, on_enter stages TaskOp
+        // Go 鈫?working, on_enter stages TaskOp
         machine.post(Ev::Go, &mut context);
         machine.advance(&mut context, &mut noop);
         assert_eq!(machine.current(), *working);
 
-        // Wait for spawned task to complete on worker thread
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Drain completion via channel
-        let completion: TaskCompletion<&'static str> =
-            CompletionReceiver::try_recv(&mut task_rx).unwrap();
-        assert_eq!(completion.output, "result");
-
-        // Feed back → transition to idle
-        machine.post(Ev::TaskDone, &mut context);
         machine.advance(&mut context, &mut noop);
         assert_eq!(machine.current(), *idle);
 
