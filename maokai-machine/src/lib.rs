@@ -62,6 +62,15 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
         self.consumers.insert(type_name::<O>(), Box::new(consumer))
     }
 
+    pub fn with_consumer<O, Cn>(mut self, consumer: Cn) -> Self
+    where
+        O: Operation + 'static,
+        Cn: OpConsumer + 'static,
+    {
+        let _ = self.set_consumer::<O, Cn>(consumer);
+        self
+    }
+
     pub fn remove_consumer<O>(&mut self) -> Option<Box<dyn OpConsumer>>
     where
         O: Operation + 'static,
@@ -463,21 +472,20 @@ mod tokio_local_tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
+                let mut machine = Machine::new(&RUNNER, &BEHAVIORS)
+                    .with_consumer::<TaskOp<LocalTask<&'static str>>, _>(TaskOpConsumer::<
+                        TokioLocalRuntime,
+                        LocalTask<&'static str>,
+                    >::new(
+                        TokioLocalRuntime
+                    ))
+                    .with_consumer::<TaskCompletionOp<&'static str>, _>(
+                        TaskCompletionConsumer::new(|completion: TaskCompletion<&'static str>| {
+                            assert_eq!(completion.output, "result");
+                            OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
+                        }),
+                    );
                 let mut envelope = Envelope::new(Ctx { logs: Vec::new() });
-
-                machine.set_consumer::<TaskOp<LocalTask<&'static str>>, _>(TaskOpConsumer::<
-                    TokioLocalRuntime,
-                    LocalTask<&'static str>,
-                >::new(
-                    TokioLocalRuntime
-                ));
-                machine.set_consumer::<TaskCompletionOp<&'static str>, _>(
-                    TaskCompletionConsumer::new(|completion: TaskCompletion<&'static str>| {
-                        assert_eq!(completion.output, "result");
-                        OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
-                    }),
-                );
 
                 let (_, idle, working) = &*TREE;
                 machine.init(*idle, &mut envelope, &mut noop);
@@ -609,19 +617,18 @@ mod tokio_mt_tests {
 
     #[tokio::test]
     async fn task_spawns_on_enter_and_completion_feeds_back() {
-        let mut machine = Machine::new(&RUNNER, &BEHAVIORS);
+        let mut machine = Machine::new(&RUNNER, &BEHAVIORS)
+            .with_consumer::<TaskOp<SendTask<&'static str>>, _>(TaskOpConsumer::<
+                TokioMtRuntime,
+                SendTask<&'static str>,
+            >::new(TokioMtRuntime))
+            .with_consumer::<TaskCompletionOp<&'static str>, _>(TaskCompletionConsumer::new(
+                |completion: TaskCompletion<&'static str>| {
+                    assert_eq!(completion.output, "result");
+                    OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
+                },
+            ));
         let mut context = Envelope::new(Ctx { logs: Vec::new() });
-
-        machine.set_consumer::<TaskOp<SendTask<&'static str>>, _>(TaskOpConsumer::<
-            TokioMtRuntime,
-            SendTask<&'static str>,
-        >::new(TokioMtRuntime));
-        machine.set_consumer::<TaskCompletionOp<&'static str>, _>(TaskCompletionConsumer::new(
-            |completion: TaskCompletion<&'static str>| {
-                assert_eq!(completion.output, "result");
-                OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
-            },
-        ));
 
         let (_, idle, working) = &*TREE;
         machine.init(*idle, &mut context, &mut noop);
