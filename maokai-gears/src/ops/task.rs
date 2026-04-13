@@ -43,18 +43,56 @@ pub struct TaskCompletion<O> {
     pub output: O,
 }
 
+pub enum TaskOutput<O> {
+    Operation(Box<dyn Operation + Send>),
+    Completion(TaskCompletion<O>),
+}
+
 pub struct TaskCompletionOp<O>(pub TaskCompletion<O>);
 
 impl<O: 'static> Operation for TaskCompletionOp<O> {}
 
-// --- Completion channel abstraction ---
-
-pub trait TaskCompletionSender<O>: Clone {
-    fn send(&self, completion: TaskCompletion<O>);
+pub struct TaskEmitter<S, O> {
+    sender: S,
+    _marker: PhantomData<fn() -> O>,
 }
 
-pub trait TaskCompletionSource<O> {
-    fn try_recv(&mut self) -> Option<TaskCompletion<O>>;
+impl<S, O> TaskEmitter<S, O> {
+    pub fn new(sender: S) -> Self {
+        Self {
+            sender,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S: Clone, O> Clone for TaskEmitter<S, O> {
+    fn clone(&self) -> Self {
+        Self::new(self.sender.clone())
+    }
+}
+
+impl<S, O> TaskEmitter<S, O>
+where
+    S: TaskMailboxSender<O>,
+{
+    pub fn emit<Op>(&self, op: Op)
+    where
+        Op: Operation + Send + 'static,
+    {
+        self.sender.send_op(Box::new(op));
+    }
+}
+
+// --- Task mailbox abstraction ---
+
+pub trait TaskMailboxSender<O>: Clone {
+    fn send_op(&self, op: Box<dyn Operation + Send>);
+    fn send_completion(&self, completion: TaskCompletion<O>);
+}
+
+pub trait TaskMailboxSource<O> {
+    fn try_recv(&mut self) -> Option<TaskOutput<O>>;
 }
 
 pub struct TaskCompletionConsumer<O, F> {
@@ -89,8 +127,8 @@ pub trait TaskRuntime<T> {
     type Running;
     type Output;
 
-    type Sender: TaskCompletionSender<Self::Output>;
-    type Source: TaskCompletionSource<Self::Output> + 'static;
+    type Sender: TaskMailboxSender<Self::Output>;
+    type Source: TaskMailboxSource<Self::Output> + 'static;
 
     fn create_channel(&self) -> (Self::Sender, Self::Source);
     fn start(&mut self, handle: TaskHandle, task: T, sender: Self::Sender) -> Self::Running;
@@ -106,7 +144,7 @@ where
     runtime: R,
     running: BTreeMap<TaskHandle, R::Running>,
     sender: R::Sender,
-    source: Box<dyn TaskCompletionSource<R::Output>>,
+    source: Box<dyn TaskMailboxSource<R::Output>>,
 }
 
 impl<R, T> TaskOpConsumer<R, T>
@@ -160,9 +198,17 @@ where
 
     fn drain(&mut self, reconciler: &mut Reconciler) -> bool {
         let mut drained = false;
-        while let Some(completion) = self.source.try_recv() {
+        while let Some(output) = self.source.try_recv() {
             drained = true;
-            let _ = reconciler.stage(TaskCompletionOp(completion), None);
+            match output {
+                TaskOutput::Operation(op) => {
+                    let op: Box<dyn Operation> = op;
+                    let _ = reconciler.stage_boxed(op, None);
+                }
+                TaskOutput::Completion(completion) => {
+                    let _ = reconciler.stage(TaskCompletionOp(completion), None);
+                }
+            }
         }
         drained
     }

@@ -6,35 +6,102 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use core::any::type_name;
-use core::cell::RefCell;
+use core::cell::{Ref, RefCell, RefMut};
+use core::marker::PhantomData;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Reconciler, Ticket};
+#[cfg(any(feature = "tokio-local", feature = "tokio-mt"))]
+use maokai_gears::ops::task::TaskHandle;
+use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
-pub struct Envelope<C> {
-    pub context: C,
-    pub reconciler: Reconciler,
+type Shared<T> = Rc<RefCell<T>>;
+type OperationInbox = Shared<VecDeque<Box<dyn Operation>>>;
+
+pub struct MachineHandle<E> {
+    inbox: OperationInbox,
+    _marker: PhantomData<fn(E)>,
 }
 
-impl<C> HasReconciler for Envelope<C> {
-    fn reconciler(&mut self) -> &mut Reconciler {
-        &mut self.reconciler
+impl<E> Clone for MachineHandle<E> {
+    fn clone(&self) -> Self {
+        Self::new(self.inbox.clone())
     }
 }
 
-pub struct Machine<'a, 'b, T, E, C> {
+impl<E> MachineHandle<E> {
+    fn new(inbox: OperationInbox) -> Self {
+        Self {
+            inbox,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn dispatch<O>(&self, op: O)
+    where
+        O: Operation + 'static,
+    {
+        self.inbox.borrow_mut().push_back(Box::new(op));
+    }
+}
+
+impl<E: 'static> MachineHandle<E> {
+    pub fn post(&self, event: E) {
+        self.dispatch(EventOp::Emit(event));
+    }
+}
+
+pub struct Envelope<E, Context> {
+    pub context: Shared<Context>,
+    pub machine: MachineHandle<E>,
+}
+
+impl<E, Context> Clone for Envelope<E, Context> {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            machine: self.machine.clone(),
+        }
+    }
+}
+
+impl<E, Context> Envelope<E, Context> {
+    fn new(ctx: Shared<Context>, machine: MachineHandle<E>) -> Self {
+        Self {
+            context: ctx,
+            machine,
+        }
+    }
+
+    pub fn context(&self) -> Ref<'_, Context> {
+        self.context.borrow()
+    }
+
+    pub fn context_mut(&self) -> RefMut<'_, Context> {
+        self.context.borrow_mut()
+    }
+}
+
+pub struct Machine<'a, 'b, T, E, Context> {
     runner: &'a Runner<'a, T>,
-    behaviors: &'b Behaviors<'b, E, Envelope<C>>,
+    behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
     current: State,
+    context: Shared<Context>,
+    reconciler: Reconciler,
+    inbox: OperationInbox,
     ready_events: SharedEventQueue<E>,
     consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
 }
 
-impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
-    pub fn new(runner: &'a Runner<'a, T>, behaviors: &'b Behaviors<'b, E, Envelope<C>>) -> Self {
+impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
+    pub fn new(
+        runner: &'a Runner<'a, T>,
+        behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
+        ctx: Context,
+    ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
+        let inbox = Rc::new(RefCell::new(VecDeque::new()));
         let mut consumers = BTreeMap::new();
         consumers.insert(
             type_name::<EventOp<E>>(),
@@ -45,6 +112,9 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
             runner,
             behaviors,
             current: runner.tree.nil(),
+            context: Rc::new(RefCell::new(ctx)),
+            reconciler: Reconciler::default(),
+            inbox,
             ready_events: ready_events.clone(),
             consumers,
         }
@@ -52,6 +122,18 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
 
     pub fn current(&self) -> State {
         self.current
+    }
+
+    pub fn envelope(&self) -> Envelope<E, Context> {
+        Envelope::new(self.context.clone(), MachineHandle::new(self.inbox.clone()))
+    }
+
+    pub fn context(&self) -> Ref<'_, Context> {
+        self.context.borrow()
+    }
+
+    pub fn context_mut(&self) -> RefMut<'_, Context> {
+        self.context.borrow_mut()
     }
 
     pub fn set_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
@@ -87,52 +169,103 @@ impl<'a, 'b, T, E: 'static, C> Machine<'a, 'b, T, E, C> {
     }
 }
 
-impl<C> Envelope<C> {
-    pub fn new(context: C) -> Self {
-        Self {
-            context,
-            reconciler: Reconciler::default(),
-        }
+#[cfg(feature = "tokio-local")]
+impl<E: 'static, Context: 'static> Envelope<E, Context> {
+    pub fn start_local_task<O: 'static, F, Fut>(&self, build: F) -> TaskHandle
+    where
+        F: FnOnce(Self) -> Fut + 'static,
+        Fut: Future<Output = O> + 'static,
+    {
+        let handle = TaskHandle::next();
+        let envelop = self.clone();
+        let task: maokai_gears::runtime::tokio_local::LocalTask<O> = Box::new(
+            move |_: maokai_gears::runtime::tokio_local::LocalTaskEmitter<O>| {
+                Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = O> + 'static>>
+            },
+        );
+        self.machine
+            .dispatch(maokai_gears::ops::task::TaskOp::Start { handle, task });
+        handle
+    }
+
+    pub fn stop_local_task<O: 'static>(&self, handle: TaskHandle) {
+        self.machine.dispatch(maokai_gears::ops::task::TaskOp::<
+            maokai_gears::runtime::tokio_local::LocalTask<O>,
+        >::Stop(handle));
     }
 }
 
-impl<T, E: 'static, C> Machine<'_, '_, T, E, C>
+#[cfg(feature = "tokio-mt")]
+impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
+    pub fn start_send_task<O: Send + 'static, F, Fut>(&self, build: F) -> TaskHandle
+    where
+        F: FnOnce(maokai_gears::runtime::tokio_mt::SendTaskCtx<Context, O>) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let handle = TaskHandle::next();
+        let ctx = self.context.borrow().clone();
+        let task: maokai_gears::runtime::tokio_mt::SendTask<O> = Box::new(move |emit| {
+            Box::pin(build(maokai_gears::runtime::tokio_mt::SendTaskCtx::new(
+                ctx, emit,
+            ))) as core::pin::Pin<Box<dyn Future<Output = O> + Send + 'static>>
+        });
+        self.machine
+            .dispatch(maokai_gears::ops::task::TaskOp::Start { handle, task });
+        handle
+    }
+
+    pub fn stop_send_task<O: Send + 'static>(&self, handle: TaskHandle) {
+        self.machine.dispatch(maokai_gears::ops::task::TaskOp::<
+            maokai_gears::runtime::tokio_mt::SendTask<O>,
+        >::Stop(handle));
+    }
+}
+
+impl<T, E: 'static, Context> Machine<'_, '_, T, E, Context>
 where
     StateTree<T>: TreeView,
 {
+    fn drain_inbox(&mut self) -> bool {
+        let mut drained = false;
+        while let Some(op) = self.inbox.borrow_mut().pop_front() {
+            drained = true;
+            let _ = self.reconciler.stage_boxed(op, None);
+        }
+        drained
+    }
+
     pub fn init(
         &mut self,
         target: State,
-        context: &mut Envelope<C>,
         on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
     ) -> bool {
         if self.current != self.runner.tree.nil() {
             return false;
         }
 
+        let envo = self.envelope();
         self.current = self
             .runner
-            .transition(self.behaviors, &self.current, &target, context);
-        self.advance(context, on_unhandled);
+            .transition(self.behaviors, &self.current, &target, envo);
+        self.advance(on_unhandled);
         true
     }
 
     /// Stage an event into the reconciler as `EventOp::Emit`.
     /// The event is not dispatched until `advance` is called.
-    pub fn post(&mut self, event: E, context: &mut Envelope<C>) {
-        context.reconciler.stage(EventOp::Emit(event), None);
+    pub fn post(&mut self, event: E) {
+        self.envelope().machine.post(event);
     }
 
     /// Commit staged operations, route them through the machine's consumers, and
     /// dispatch resulting events until the machine becomes stable.
-    pub fn advance(
-        &mut self,
-        context: &mut Envelope<C>,
-        on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
-    ) {
+    pub fn advance(&mut self, on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>)) {
         loop {
-            while context.reconciler.has_pending() {
-                context.reconciler.commit(|ticket, mut op| {
+            let mut progressed = self.drain_inbox();
+
+            while self.reconciler.has_pending() {
+                progressed = true;
+                self.reconciler.commit(|ticket, mut op| {
                     loop {
                         let key = op.operation_key();
 
@@ -151,7 +284,7 @@ where
 
             let mut drained_any = false;
             for consumer in self.consumers.values_mut() {
-                if consumer.drain(&mut context.reconciler) {
+                if consumer.drain(&mut self.reconciler) {
                     drained_any = true;
                 }
             }
@@ -160,13 +293,26 @@ where
                 continue;
             }
 
-            while let Some(event) = self.ready_events.borrow_mut().pop_front() {
-                self.current = self
-                    .runner
-                    .dispatch(self.behaviors, &self.current, &event, context);
+            if self.drain_inbox() {
+                continue;
             }
 
-            if !context.reconciler.has_pending() && self.ready_events.borrow().is_empty() {
+            while let Some(event) = self.ready_events.borrow_mut().pop_front() {
+                progressed = true;
+                self.current =
+                    self.runner
+                        .dispatch(self.behaviors, &self.current, &event, self.envelope());
+            }
+
+            if self.drain_inbox() {
+                continue;
+            }
+
+            if !progressed
+                && !self.reconciler.has_pending()
+                && self.ready_events.borrow().is_empty()
+                && self.inbox.borrow().is_empty()
+            {
                 break;
             }
         }
@@ -191,7 +337,7 @@ mod tests {
         Shine,
     }
 
-    struct LightContext {
+    struct Context {
         logs: Vec<&'static str>,
     }
 
@@ -213,18 +359,18 @@ mod tests {
     struct OpenedBehavior;
     struct ShiningBehavior;
 
-    impl Behavior<LightEvent, Envelope<LightContext>> for ClosedBehavior {
-        fn on_enter(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("enter:closed");
+    impl Behavior<LightEvent, Envelope<LightEvent, Context>> for ClosedBehavior {
+        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("enter:closed");
         }
-        fn on_exit(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("exit:closed");
+        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("exit:closed");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: &mut Envelope<LightContext>,
+            _ctx: Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, _, opened, _) = &*SETUP_TREE;
@@ -235,18 +381,18 @@ mod tests {
         }
     }
 
-    impl Behavior<LightEvent, Envelope<LightContext>> for OpenedBehavior {
-        fn on_enter(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("enter:opened");
+    impl Behavior<LightEvent, Envelope<LightEvent, Context>> for OpenedBehavior {
+        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("enter:opened");
         }
-        fn on_exit(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("exit:opened");
+        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("exit:opened");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: &mut Envelope<LightContext>,
+            _ctx: Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, closed, _, shining) = &*SETUP_TREE;
@@ -259,18 +405,18 @@ mod tests {
         }
     }
 
-    impl Behavior<LightEvent, Envelope<LightContext>> for ShiningBehavior {
-        fn on_enter(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("enter:shining");
+    impl Behavior<LightEvent, Envelope<LightEvent, Context>> for ShiningBehavior {
+        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("enter:shining");
         }
-        fn on_exit(&self, _t: &Transition, ctx: &mut Envelope<LightContext>) {
-            ctx.context.logs.push("exit:shining");
+        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+            envo.context.borrow_mut().logs.push("exit:shining");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: &mut Envelope<LightContext>,
+            _ctx: Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -281,7 +427,7 @@ mod tests {
         }
     }
 
-    static BEHAVIORS: LazyLock<Behaviors<'static, LightEvent, Envelope<LightContext>>> =
+    static BEHAVIORS: LazyLock<Behaviors<'static, LightEvent, Envelope<LightEvent, Context>>> =
         LazyLock::new(|| {
             let (_, closed, opened, shining) = &*SETUP_TREE;
             let mut behaviors = Behaviors::default();
@@ -291,12 +437,8 @@ mod tests {
             behaviors
         });
 
-    fn new_envelope() -> Envelope<LightContext> {
-        Envelope::new(LightContext { logs: Vec::new() })
-    }
-
-    fn new_machine() -> Machine<'static, 'static, &'static str, LightEvent, LightContext> {
-        Machine::new(&RUNNER, &BEHAVIORS)
+    fn new_machine() -> Machine<'static, 'static, &'static str, LightEvent, Context> {
+        Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
     }
 
     /// No-op commit handler for tests that don't produce non-event operations.
@@ -307,20 +449,19 @@ mod tests {
     #[test]
     fn init_transitions_from_nil() {
         let mut machine = new_machine();
-        let mut envelope = new_envelope();
 
         let (_, closed, _, _) = &*SETUP_TREE;
-        machine.init(*closed, &mut envelope, &mut noop);
+        machine.init(*closed, &mut noop);
         assert_eq!(machine.current(), *closed);
-        assert_eq!(envelope.context.logs, alloc::vec!["enter:closed"]);
+        assert_eq!(machine.context().logs, alloc::vec!["enter:closed"]);
 
-        machine.post(LightEvent::Open, &mut envelope);
-        machine.advance(&mut envelope, &mut noop);
+        machine.post(LightEvent::Open);
+        machine.advance(&mut noop);
 
         let (_, _, opened, _) = &*SETUP_TREE;
         assert_eq!(machine.current(), *opened);
         assert_eq!(
-            envelope.context.logs,
+            machine.context().logs,
             alloc::vec!["enter:closed", "exit:closed", "enter:opened"]
         );
     }
@@ -328,19 +469,17 @@ mod tests {
     #[test]
     fn event_bubbles_from_child_to_parent() {
         let mut machine = new_machine();
-        let mut envelope = new_envelope();
-
         let (_, _, _, shining) = &*SETUP_TREE;
-        machine.init(*shining, &mut envelope, &mut noop);
+        machine.init(*shining, &mut noop);
 
         // Close is Ignored by ShiningBehavior → bubbles to OpenedBehavior → Transition(closed)
-        machine.post(LightEvent::Close, &mut envelope);
-        machine.advance(&mut envelope, &mut noop);
+        machine.post(LightEvent::Close);
+        machine.advance(&mut noop);
 
         let (_, closed, _, _) = &*SETUP_TREE;
         assert_eq!(machine.current(), *closed);
         assert_eq!(
-            envelope.context.logs,
+            machine.context().logs,
             alloc::vec![
                 "enter:opened",
                 "enter:shining",
@@ -354,18 +493,33 @@ mod tests {
     #[test]
     fn shine_transitions_into_child_state() {
         let mut machine = new_machine();
-        let mut envelope = new_envelope();
-
         let (_, _, opened, shining) = &*SETUP_TREE;
-        machine.init(*opened, &mut envelope, &mut noop);
+        machine.init(*opened, &mut noop);
 
-        machine.post(LightEvent::Shine, &mut envelope);
-        machine.advance(&mut envelope, &mut noop);
+        machine.post(LightEvent::Shine);
+        machine.advance(&mut noop);
 
         assert_eq!(machine.current(), *shining);
         assert_eq!(
-            envelope.context.logs,
+            machine.context().logs,
             alloc::vec!["enter:opened", "enter:shining"]
+        );
+    }
+
+    #[test]
+    fn cloned_envelope_can_post_back_into_machine() {
+        let mut machine = new_machine();
+        let (_, closed, opened, _) = &*SETUP_TREE;
+        machine.init(*closed, &mut noop);
+
+        let envo = machine.envelope();
+        envo.machine.post(LightEvent::Open);
+        machine.advance(&mut noop);
+
+        assert_eq!(machine.current(), *opened);
+        assert_eq!(
+            machine.context().logs,
+            alloc::vec!["enter:closed", "exit:closed", "enter:opened"]
         );
     }
 }
@@ -380,11 +534,10 @@ mod tokio_local_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use maokai_gears::ops::EventOp;
     use maokai_gears::ops::task::{
         TaskCompletion, TaskCompletionConsumer, TaskCompletionOp, TaskOp, TaskOpConsumer,
     };
-    use maokai_gears::runtime::tokio_local::{LocalTask, LocalTaskOpsExt, TokioLocalRuntime};
+    use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalRuntime};
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -395,7 +548,8 @@ mod tokio_local_tests {
         TaskDone,
     }
 
-    struct Ctx {
+    #[derive(Clone)]
+    struct Context {
         logs: Vec<&'static str>,
     }
 
@@ -411,18 +565,18 @@ mod tokio_local_tests {
     struct IdleBehavior;
     struct WorkingBehavior;
 
-    impl Behavior<Ev, Envelope<Ctx>> for IdleBehavior {
-        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("enter:idle");
+    impl Behavior<Ev, Envelope<Ev, Context>> for IdleBehavior {
+        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("enter:idle");
         }
-        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("exit:idle");
+        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("exit:idle");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            _: &mut Envelope<Ctx>,
+            _: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -432,24 +586,24 @@ mod tokio_local_tests {
         }
     }
 
-    impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
-        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("enter:working");
-            let _ = ctx.start_local_task(async { "result" });
+    impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
+        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("enter:working");
+            let _ = envo.start_local_task(|_envo| async move { "result" });
         }
-        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("exit:working");
+        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("exit:working");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            ctx: &mut Envelope<Ctx>,
+            envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
                 Ev::TaskDone => {
-                    ctx.context.logs.push("task:done");
+                    envo.context.borrow_mut().logs.push("task:done");
                     EventReply::Transition(TREE.1)
                 }
                 _ => EventReply::Ignored,
@@ -457,13 +611,14 @@ mod tokio_local_tests {
         }
     }
 
-    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ctx>>> = LazyLock::new(|| {
-        let (_, idle, working) = &*TREE;
-        let mut b = Behaviors::default();
-        b.register(idle, IdleBehavior);
-        b.register(working, WorkingBehavior);
-        b
-    });
+    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ev, Context>>> =
+        LazyLock::new(|| {
+            let (_, idle, working) = &*TREE;
+            let mut b = Behaviors::default();
+            b.register(idle, IdleBehavior);
+            b.register(working, WorkingBehavior);
+            b
+        });
 
     fn noop(_: Ticket, _: Box<dyn Operation>) {}
 
@@ -472,7 +627,7 @@ mod tokio_local_tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut machine = Machine::new(&RUNNER, &BEHAVIORS)
+                let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
                     .with_consumer::<TaskOp<LocalTask<&'static str>>, _>(TaskOpConsumer::<
                         TokioLocalRuntime,
                         LocalTask<&'static str>,
@@ -485,25 +640,29 @@ mod tokio_local_tests {
                             OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
                         }),
                     );
-                let mut envelope = Envelope::new(Ctx { logs: Vec::new() });
-
                 let (_, idle, working) = &*TREE;
-                machine.init(*idle, &mut envelope, &mut noop);
+                machine.init(*idle, &mut noop);
                 assert_eq!(machine.current(), *idle);
 
                 // Go → working, on_enter stages TaskOp
-                machine.post(Ev::Go, &mut envelope);
-                machine.advance(&mut envelope, &mut noop);
+                machine.post(Ev::Go);
+                machine.advance(&mut noop);
                 assert_eq!(machine.current(), *working);
 
                 // Yield to let spawned local task complete and let the machine drain it.
                 tokio::task::yield_now().await;
 
-                machine.advance(&mut envelope, &mut noop);
+                for _ in 0..8 {
+                    machine.advance(&mut noop);
+                    if machine.current() == *idle {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
                 assert_eq!(machine.current(), *idle);
 
                 assert_eq!(
-                    envelope.context.logs,
+                    machine.context().logs,
                     vec![
                         "enter:idle",
                         "exit:idle",
@@ -532,7 +691,7 @@ mod tokio_mt_tests {
     use maokai_gears::ops::task::{
         TaskCompletion, TaskCompletionConsumer, TaskCompletionOp, TaskOp, TaskOpConsumer,
     };
-    use maokai_gears::runtime::tokio_mt::{SendTask, SendTaskOpsExt, TokioMtRuntime};
+    use maokai_gears::runtime::tokio_mt::{SendTask, TokioMtRuntime};
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -543,7 +702,8 @@ mod tokio_mt_tests {
         TaskDone,
     }
 
-    struct Ctx {
+    #[derive(Clone)]
+    struct Context {
         logs: Vec<&'static str>,
     }
 
@@ -559,18 +719,18 @@ mod tokio_mt_tests {
     struct IdleBehavior;
     struct WorkingBehavior;
 
-    impl Behavior<Ev, Envelope<Ctx>> for IdleBehavior {
-        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("enter:idle");
+    impl Behavior<Ev, Envelope<Ev, Context>> for IdleBehavior {
+        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("enter:idle");
         }
-        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("exit:idle");
+        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("exit:idle");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            _: &mut Envelope<Ctx>,
+            _: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -580,24 +740,27 @@ mod tokio_mt_tests {
         }
     }
 
-    impl Behavior<Ev, Envelope<Ctx>> for WorkingBehavior {
-        fn on_enter(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("enter:working");
-            let _ = ctx.start_send_task(async { "result" });
+    impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
+        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("enter:working");
+            let _ = envo.start_send_task(|task_ctx| async move {
+                task_ctx.emit(EventOp::Emit(Ev::TaskDone));
+                "result"
+            });
         }
-        fn on_exit(&self, _: &Transition, ctx: &mut Envelope<Ctx>) {
-            ctx.context.logs.push("exit:working");
+        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+            envo.context.borrow_mut().logs.push("exit:working");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            ctx: &mut Envelope<Ctx>,
+            envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
                 Ev::TaskDone => {
-                    ctx.context.logs.push("task:done");
+                    envo.context.borrow_mut().logs.push("task:done");
                     EventReply::Transition(TREE.1)
                 }
                 _ => EventReply::Ignored,
@@ -605,19 +768,20 @@ mod tokio_mt_tests {
         }
     }
 
-    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ctx>>> = LazyLock::new(|| {
-        let (_, idle, working) = &*TREE;
-        let mut b = Behaviors::default();
-        b.register(idle, IdleBehavior);
-        b.register(working, WorkingBehavior);
-        b
-    });
+    static BEHAVIORS: LazyLock<Behaviors<'static, Ev, Envelope<Ev, Context>>> =
+        LazyLock::new(|| {
+            let (_, idle, working) = &*TREE;
+            let mut b = Behaviors::default();
+            b.register(idle, IdleBehavior);
+            b.register(working, WorkingBehavior);
+            b
+        });
 
     fn noop(_: Ticket, _: Box<dyn Operation>) {}
 
     #[tokio::test]
     async fn task_spawns_on_enter_and_completion_feeds_back() {
-        let mut machine = Machine::new(&RUNNER, &BEHAVIORS)
+        let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
             .with_consumer::<TaskOp<SendTask<&'static str>>, _>(TaskOpConsumer::<
                 TokioMtRuntime,
                 SendTask<&'static str>,
@@ -628,24 +792,28 @@ mod tokio_mt_tests {
                     OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
                 },
             ));
-        let mut context = Envelope::new(Ctx { logs: Vec::new() });
-
         let (_, idle, working) = &*TREE;
-        machine.init(*idle, &mut context, &mut noop);
+        machine.init(*idle, &mut noop);
         assert_eq!(machine.current(), *idle);
 
         // Go → working, on_enter stages TaskOp
-        machine.post(Ev::Go, &mut context);
-        machine.advance(&mut context, &mut noop);
+        machine.post(Ev::Go);
+        machine.advance(&mut noop);
         assert_eq!(machine.current(), *working);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        machine.advance(&mut context, &mut noop);
+        for _ in 0..8 {
+            machine.advance(&mut noop);
+            if machine.current() == *idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(machine.current(), *idle);
 
         assert_eq!(
-            context.context.logs,
+            machine.context().logs,
             vec![
                 "enter:idle",
                 "exit:idle",

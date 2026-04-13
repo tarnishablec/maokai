@@ -19,6 +19,8 @@ and to keep the system moving until it becomes stable.
 A machine owns:
 
 - the current `State`
+- the user-facing `Context`
+- the reconciler and operation inbox for the instance
 - the event queue that is ready to be dispatched
 - the mapping from `Operation` type to `OpConsumer`
 - the coordination loop that repeatedly commits operations, drains consumers, and dispatches resulting events
@@ -144,16 +146,18 @@ without changing the machine's own design.
 
 ## Envelope
 
-`Envelope<C>` is the machine-facing context wrapper.
+`Envelope<Event, Context>` is a machine snapshot and handle.
 
-It combines:
+It is not the machine's storage object. The machine owns the real runtime state. The envelope is the cloneable view
+that behaviors receive when the runner enters, exits, or dispatches against a state.
 
-- user context `C`
-- the reconciler used for staging work
+An envelope gives behaviors access to:
 
-The envelope exists so behaviors can work with one mutable context object while still having access to the machine's
-operation pipeline. This keeps behavior signatures simple without forcing user state and machine infrastructure into the
-same type.
+- the shared user-facing `Context`
+- a `machine` handle that can post events and dispatch operations back into the instance
+
+This separation is deliberate. The user-facing `Context` remains domain state, while machine runtime mechanics stay
+inside `Machine`. The envelope is the bridge between the two.
 
 ---
 

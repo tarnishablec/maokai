@@ -123,14 +123,10 @@ impl Reconciler {
         ticket
     }
 
-    pub fn stage<O: Operation + 'static>(
-        &mut self,
-        op: O,
-        priority: Option<u32>,
-    ) -> Option<Ticket> {
+    pub fn stage_boxed(&mut self, op: Box<dyn Operation>, priority: Option<u32>) -> Option<Ticket> {
         let priority = priority.unwrap_or(0);
         let ticket = self.next_ticket(priority);
-        let mut incoming = Box::new(op);
+        let mut incoming = op;
         let mut keep = true;
 
         let rules = core::mem::take(&mut self.rules);
@@ -161,6 +157,14 @@ impl Reconciler {
         } else {
             None
         }
+    }
+
+    pub fn stage<O: Operation + 'static>(
+        &mut self,
+        op: O,
+        priority: Option<u32>,
+    ) -> Option<Ticket> {
+        self.stage_boxed(Box::new(op), priority)
     }
 
     pub fn unstage(&mut self, ticket: Ticket) -> Option<Box<dyn Operation>> {

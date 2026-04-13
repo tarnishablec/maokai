@@ -4,68 +4,75 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use core::cell::RefCell;
-use core::future::Future;
 use core::pin::Pin;
-use maokai_reconciler::Ticket;
 use tokio::task::{JoinHandle, spawn_local};
 
 use crate::ops::task::*;
 
-pub type LocalTask<O> = Pin<Box<dyn Future<Output = O> + 'static>>;
-type LocalTaskCompletionQueue<O> = Rc<RefCell<VecDeque<TaskCompletion<O>>>>;
+type LocalTaskFuture<O> = Pin<Box<dyn Future<Output = O> + 'static>>;
+pub type LocalTask<O> = Box<dyn FnOnce(LocalTaskEmitter<O>) -> LocalTaskFuture<O> + 'static>;
+type LocalTaskMailbox<O> = Rc<RefCell<VecDeque<TaskOutput<O>>>>;
 
-pub struct LocalTaskCompletionSender<O>(LocalTaskCompletionQueue<O>);
+pub struct LocalTaskMailboxSender<O>(LocalTaskMailbox<O>);
 
-impl<O> Clone for LocalTaskCompletionSender<O> {
+impl<O> Clone for LocalTaskMailboxSender<O> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-pub struct LocalTaskCompletionSource<O>(LocalTaskCompletionQueue<O>);
+pub struct LocalTaskMailboxSource<O>(LocalTaskMailbox<O>);
 
-impl<O> TaskCompletionSender<O> for LocalTaskCompletionSender<O> {
-    fn send(&self, completion: TaskCompletion<O>) {
-        self.0.borrow_mut().push_back(completion);
+pub type LocalTaskEmitter<O> = TaskEmitter<LocalTaskMailboxSender<O>, O>;
+
+pub struct LocalTaskCtx<Context, O> {
+    pub ctx: Context,
+    emitter: LocalTaskEmitter<O>,
+}
+
+impl<Context, O> LocalTaskCtx<Context, O> {
+    pub fn new(ctx: Context, emitter: LocalTaskEmitter<O>) -> Self {
+        Self { ctx, emitter }
+    }
+
+    pub fn emit<Op>(&self, op: Op)
+    where
+        Op: maokai_reconciler::Operation + Send + 'static,
+    {
+        self.emitter.emit(op);
     }
 }
 
-impl<O> TaskCompletionSource<O> for LocalTaskCompletionSource<O> {
-    fn try_recv(&mut self) -> Option<TaskCompletion<O>> {
+impl<O> TaskMailboxSender<O> for LocalTaskMailboxSender<O> {
+    fn send_op(&self, op: Box<dyn maokai_reconciler::Operation + Send>) {
+        self.0.borrow_mut().push_back(TaskOutput::Operation(op));
+    }
+
+    fn send_completion(&self, completion: TaskCompletion<O>) {
+        self.0
+            .borrow_mut()
+            .push_back(TaskOutput::Completion(completion));
+    }
+}
+
+impl<O> TaskMailboxSource<O> for LocalTaskMailboxSource<O> {
+    fn try_recv(&mut self) -> Option<TaskOutput<O>> {
         self.0.borrow_mut().pop_front()
     }
 }
 
-fn completion_channel<O>() -> (LocalTaskCompletionSender<O>, LocalTaskCompletionSource<O>) {
+fn completion_channel<O>() -> (LocalTaskMailboxSender<O>, LocalTaskMailboxSource<O>) {
     let q = Rc::new(RefCell::new(VecDeque::new()));
-    (
-        LocalTaskCompletionSender(q.clone()),
-        LocalTaskCompletionSource(q),
-    )
+    (LocalTaskMailboxSender(q.clone()), LocalTaskMailboxSource(q))
 }
-
-pub trait LocalTaskOpsExt<O: 'static>: TaskOpsExt<LocalTask<O>> {
-    fn start_local_task<F>(&mut self, future: F) -> Option<TaskHandle>
-    where
-        F: Future<Output = O> + 'static,
-    {
-        self.start_task(Box::pin(future) as LocalTask<O>)
-    }
-
-    fn stop_local_task(&mut self, handle: TaskHandle) -> Option<Ticket> {
-        self.stop_task(handle)
-    }
-}
-
-impl<O: 'static, Ctx> LocalTaskOpsExt<O> for Ctx where Ctx: TaskOpsExt<LocalTask<O>> {}
 
 pub struct TokioLocalRuntime;
 
 impl<O: 'static> TaskRuntime<LocalTask<O>> for TokioLocalRuntime {
     type Running = JoinHandle<()>;
     type Output = O;
-    type Sender = LocalTaskCompletionSender<O>;
-    type Source = LocalTaskCompletionSource<O>;
+    type Sender = LocalTaskMailboxSender<O>;
+    type Source = LocalTaskMailboxSource<O>;
 
     fn create_channel(&self) -> (Self::Sender, Self::Source) {
         completion_channel()
@@ -78,8 +85,8 @@ impl<O: 'static> TaskRuntime<LocalTask<O>> for TokioLocalRuntime {
         sender: Self::Sender,
     ) -> Self::Running {
         spawn_local(async move {
-            let output = task.await;
-            TaskCompletionSender::send(&sender, TaskCompletion { handle, output });
+            let output = task(LocalTaskEmitter::new(sender.clone())).await;
+            TaskMailboxSender::send_completion(&sender, TaskCompletion { handle, output });
         })
     }
 
@@ -105,12 +112,15 @@ mod tests {
                 let (sender, mut receiver) = completion_channel();
 
                 let handle = TaskHandle::next();
-                let task: LocalTask<i32> = Box::pin(async { 42 });
+                let task: LocalTask<i32> = Box::new(|_| Box::pin(async { 42 }));
 
                 let join = runtime.start(handle, task, sender);
                 join.await.unwrap();
 
-                let completion = receiver.try_recv().unwrap();
+                let completion = match receiver.try_recv().unwrap() {
+                    TaskOutput::Completion(completion) => completion,
+                    TaskOutput::Operation(_) => panic!("expected completion"),
+                };
                 assert_eq!(completion.output, 42);
                 assert!(receiver.try_recv().is_none());
             })
@@ -126,8 +136,10 @@ mod tests {
                 let (sender, mut receiver) = completion_channel();
 
                 let handle = TaskHandle::next();
-                let task: LocalTask<()> = Box::pin(async {
-                    tokio::time::sleep(std::time::Duration::from_secs(999)).await;
+                let task: LocalTask<()> = Box::new(|_| {
+                    Box::pin(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(999)).await;
+                    })
                 });
 
                 let join = runtime.start(handle, task, sender);
