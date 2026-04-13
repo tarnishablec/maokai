@@ -13,7 +13,7 @@ pub type SendTask<O> = Pin<Box<dyn Future<Output = O> + Send + 'static>>;
 pub type SendTaskCompletionSender<O> = mpsc::UnboundedSender<TaskCompletion<O>>;
 pub type SendTaskCompletionSource<O> = mpsc::UnboundedReceiver<TaskCompletion<O>>;
 
-pub fn completion_channel<O>() -> (SendTaskCompletionSender<O>, SendTaskCompletionSource<O>) {
+fn completion_channel<O>() -> (SendTaskCompletionSender<O>, SendTaskCompletionSource<O>) {
     mpsc::unbounded_channel()
 }
 
@@ -50,6 +50,11 @@ impl<O: Send + 'static> TaskRuntime<SendTask<O>> for TokioMtRuntime {
     type Running = JoinHandle<()>;
     type Output = O;
     type Sender = SendTaskCompletionSender<O>;
+    type Source = SendTaskCompletionSource<O>;
+
+    fn create_channel(&self) -> (Self::Sender, Self::Source) {
+        completion_channel()
+    }
 
     fn start(
         &mut self,
@@ -81,8 +86,7 @@ mod tests {
         let mut runtime = TokioMtRuntime;
         let (sender, mut receiver) = completion_channel();
 
-        let mut handles = TaskHandles::default();
-        let handle = handles.alloc();
+        let handle = TaskHandle::next();
         let task: SendTask<i32> = Box::pin(async { 42 });
 
         let join = runtime.start(handle, task, sender);
@@ -98,8 +102,7 @@ mod tests {
         let mut runtime = TokioMtRuntime;
         let (sender, mut receiver) = completion_channel();
 
-        let mut handles = TaskHandles::default();
-        let handle = handles.alloc();
+        let handle = TaskHandle::next();
         let task: SendTask<()> = Box::pin(async {
             tokio::time::sleep(std::time::Duration::from_secs(999)).await;
         });

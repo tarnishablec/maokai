@@ -23,6 +23,12 @@ pub enum OpFlow {
 
 pub trait OpConsumer {
     fn consume(&mut self, ticket: Ticket, op: Box<dyn Operation>) -> OpFlow;
+
+    /// Called each advance cycle to let consumers inject operations from external sources.
+    /// Returns `true` if any operations were staged.
+    fn drain(&mut self, _reconciler: &mut Reconciler) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

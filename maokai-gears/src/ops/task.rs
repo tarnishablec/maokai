@@ -1,36 +1,18 @@
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::rc::Rc;
-use core::cell::RefCell;
+use alloc::collections::BTreeMap;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 use downcast::Downcast;
-use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Ticket};
-use slotmap::{SlotMap, new_key_type};
+use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 
-new_key_type! {
-    pub struct TaskHandle;
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskHandle(u64);
 
-pub struct TaskHandles {
-    handles: SlotMap<TaskHandle, ()>,
-}
-
-impl Default for TaskHandles {
-    fn default() -> Self {
-        Self {
-            handles: SlotMap::with_key(),
-        }
+impl TaskHandle {
+    pub fn next() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
-}
-
-impl TaskHandles {
-    pub fn alloc(&mut self) -> TaskHandle {
-        self.handles.insert(())
-    }
-}
-
-pub trait TaskSpawner {
-    fn alloc_task_handle(&mut self) -> TaskHandle;
 }
 
 pub enum TaskOp<T> {
@@ -40,9 +22,9 @@ pub enum TaskOp<T> {
 
 impl<T: 'static> Operation for TaskOp<T> {}
 
-pub trait TaskOpsExt<T: 'static>: HasReconciler + TaskSpawner {
+pub trait TaskOpsExt<T: 'static>: HasReconciler {
     fn start_task(&mut self, task: T) -> Option<TaskHandle> {
-        let handle = self.alloc_task_handle();
+        let handle = TaskHandle::next();
         self.reconciler()
             .stage(TaskOp::Start { handle, task }, None)
             .map(|_| handle)
@@ -53,7 +35,7 @@ pub trait TaskOpsExt<T: 'static>: HasReconciler + TaskSpawner {
     }
 }
 
-impl<T: 'static, Ctx> TaskOpsExt<T> for Ctx where Ctx: HasReconciler + TaskSpawner {}
+impl<T: 'static, Ctx> TaskOpsExt<T> for Ctx where Ctx: HasReconciler {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompletion<O> {
@@ -73,46 +55,6 @@ pub trait TaskCompletionSender<O>: Clone {
 
 pub trait TaskCompletionSource<O> {
     fn try_recv(&mut self) -> Option<TaskCompletion<O>>;
-}
-
-pub trait CompletionSourceProvider {
-    fn register_completion_source<O, S>(&mut self, source: S)
-    where
-        O: 'static,
-        S: TaskCompletionSource<O> + 'static;
-}
-
-pub trait ConsumerProvider {
-    fn register_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
-    where
-        O: Operation + 'static,
-        Cn: OpConsumer + 'static;
-}
-
-pub fn install_task_runtime<M, Op, O, Cn, S>(machine: &mut M, consumer: Cn, source: S)
-where
-    M: ConsumerProvider + CompletionSourceProvider,
-    Op: Operation + 'static,
-    O: 'static,
-    Cn: OpConsumer + 'static,
-    S: TaskCompletionSource<O> + 'static,
-{
-    let _ = machine.register_consumer::<Op, Cn>(consumer);
-    machine.register_completion_source::<O, S>(source);
-}
-
-// Local channel: Rc<RefCell<VecDeque>> serves as both sender and receiver.
-
-impl<O> TaskCompletionSender<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
-    fn send(&self, completion: TaskCompletion<O>) {
-        self.borrow_mut().push_back(completion);
-    }
-}
-
-impl<O> TaskCompletionSource<O> for Rc<RefCell<VecDeque<TaskCompletion<O>>>> {
-    fn try_recv(&mut self) -> Option<TaskCompletion<O>> {
-        self.borrow_mut().pop_front()
-    }
 }
 
 pub struct TaskCompletionConsumer<O, F> {
@@ -148,7 +90,9 @@ pub trait TaskRuntime<T> {
     type Output;
 
     type Sender: TaskCompletionSender<Self::Output>;
+    type Source: TaskCompletionSource<Self::Output> + 'static;
 
+    fn create_channel(&self) -> (Self::Sender, Self::Source);
     fn start(&mut self, handle: TaskHandle, task: T, sender: Self::Sender) -> Self::Running;
     fn stop(&mut self, handle: TaskHandle, running: Self::Running);
 }
@@ -162,17 +106,20 @@ where
     runtime: R,
     running: BTreeMap<TaskHandle, R::Running>,
     sender: R::Sender,
+    source: Box<dyn TaskCompletionSource<R::Output>>,
 }
 
 impl<R, T> TaskOpConsumer<R, T>
 where
     R: TaskRuntime<T>,
 {
-    pub fn new(runtime: R, sender: R::Sender) -> Self {
+    pub fn new(runtime: R) -> Self {
+        let (sender, source) = runtime.create_channel();
         Self {
             runtime,
             running: BTreeMap::new(),
             sender,
+            source: Box::new(source),
         }
     }
 
@@ -189,6 +136,7 @@ impl<R, T> OpConsumer for TaskOpConsumer<R, T>
 where
     R: TaskRuntime<T>,
     T: 'static,
+    R::Output: 'static,
 {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
         match Downcast::<TaskOp<T>>::downcast(op) {
@@ -208,5 +156,14 @@ where
             }
             Err(err) => OpFlow::Continue(err.into_object()),
         }
+    }
+
+    fn drain(&mut self, reconciler: &mut Reconciler) -> bool {
+        let mut drained = false;
+        while let Some(completion) = self.source.try_recv() {
+            drained = true;
+            let _ = reconciler.stage(TaskCompletionOp(completion), None);
+        }
+        drained
     }
 }
