@@ -9,7 +9,7 @@ use core::any::type_name;
 use core::cell::RefCell;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_gears::ops::task::{HasTaskHandles, TaskHandle, TaskHandles};
+use maokai_gears::ops::task::{TaskSpawner, TaskHandle, TaskHandles};
 use maokai_reconciler::{HasReconciler, OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
@@ -26,7 +26,7 @@ impl<C> HasReconciler for Envelope<C> {
     }
 }
 
-impl<C> HasTaskHandles for Envelope<C> {
+impl<C> TaskSpawner for Envelope<C> {
     fn alloc_task_handle(&mut self) -> TaskHandle {
         self.task_handles.alloc()
     }
@@ -102,7 +102,7 @@ where
 {
     pub fn init(
         &mut self,
-        event: E,
+        target: State,
         context: &mut Envelope<C>,
         on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
     ) -> bool {
@@ -110,7 +110,9 @@ where
             return false;
         }
 
-        self.post(event, context);
+        self.current =
+            self.runner
+                .transition(self.behaviors, &self.current, &target, context);
         self.advance(context, on_unhandled);
         true
     }
@@ -292,8 +294,11 @@ mod tests {
         let mut envelope = new_envelope();
 
         let (_, closed, _, _) = &*SETUP_TREE;
-        machine.current = *closed;
+        machine.init(*closed, &mut envelope, &mut noop);
+        assert_eq!(machine.current(), *closed);
+        assert_eq!(envelope.context.logs, alloc::vec!["enter:closed"]);
 
+        // Now post Open → transition to opened
         machine.post(LightEvent::Open, &mut envelope);
         machine.advance(&mut envelope, &mut noop);
 
@@ -301,7 +306,7 @@ mod tests {
         assert_eq!(machine.current(), *opened);
         assert_eq!(
             envelope.context.logs,
-            alloc::vec!["exit:closed", "enter:opened"]
+            alloc::vec!["enter:closed", "exit:closed", "enter:opened"]
         );
     }
 
@@ -311,7 +316,7 @@ mod tests {
         let mut envelope = new_envelope();
 
         let (_, _, _, shining) = &*SETUP_TREE;
-        machine.current = *shining;
+        machine.init(*shining, &mut envelope, &mut noop);
 
         // Close is Ignored by ShiningBehavior → bubbles to OpenedBehavior → Transition(closed)
         machine.post(LightEvent::Close, &mut envelope);
@@ -321,7 +326,13 @@ mod tests {
         assert_eq!(machine.current(), *closed);
         assert_eq!(
             envelope.context.logs,
-            alloc::vec!["exit:shining", "exit:opened", "enter:closed"]
+            alloc::vec![
+                "enter:opened",
+                "enter:shining",
+                "exit:shining",
+                "exit:opened",
+                "enter:closed"
+            ]
         );
     }
 
@@ -331,13 +342,16 @@ mod tests {
         let mut envelope = new_envelope();
 
         let (_, _, opened, shining) = &*SETUP_TREE;
-        machine.current = *opened;
+        machine.init(*opened, &mut envelope, &mut noop);
 
         machine.post(LightEvent::Shine, &mut envelope);
         machine.advance(&mut envelope, &mut noop);
 
         assert_eq!(machine.current(), *shining);
-        assert_eq!(envelope.context.logs, alloc::vec!["enter:shining"]);
+        assert_eq!(
+            envelope.context.logs,
+            alloc::vec!["enter:opened", "enter:shining"]
+        );
     }
 }
 
@@ -446,9 +460,9 @@ mod tokio_local_tests {
                 let (consumer, mut task_rx) = TaskOpConsumer::new(TokioLocalRuntime);
                 machine.set_consumer::<TaskOp<LocalTask<&'static str>>, _>(consumer);
 
-                // Start from idle
                 let (_, idle, working) = &*TREE;
-                machine.current = *idle;
+                machine.init(*idle, &mut envelope, &mut noop);
+                assert_eq!(machine.current(), *idle);
 
                 // Go → working, on_enter stages TaskOp
                 machine.post(Ev::Go, &mut envelope);
@@ -471,6 +485,7 @@ mod tokio_local_tests {
                 assert_eq!(
                     envelope.context.logs,
                     vec![
+                        "enter:idle",
                         "exit:idle",
                         "enter:working",
                         "task:done",
@@ -585,9 +600,9 @@ mod tokio_mt_tests {
         let (consumer, mut task_rx) = TaskOpConsumer::new(TokioMtRuntime);
         machine.set_consumer::<TaskOp<SendTask<&'static str>>, _>(consumer);
 
-        // Start from idle
         let (_, idle, working) = &*TREE;
-        machine.current = *idle;
+        machine.init(*idle, &mut context, &mut noop);
+        assert_eq!(machine.current(), *idle);
 
         // Go → working, on_enter stages TaskOp
         machine.post(Ev::Go, &mut context);
@@ -610,6 +625,7 @@ mod tokio_mt_tests {
         assert_eq!(
             context.context.logs,
             vec![
+                "enter:idle",
                 "exit:idle",
                 "enter:working",
                 "task:done",

@@ -28,7 +28,7 @@ impl TaskHandles {
     }
 }
 
-pub trait HasTaskHandles {
+pub trait TaskSpawner {
     fn alloc_task_handle(&mut self) -> TaskHandle;
 }
 
@@ -39,7 +39,7 @@ pub enum TaskOp<T> {
 
 impl<T: 'static> Operation for TaskOp<T> {}
 
-pub trait TaskOpsExt<T: 'static>: HasReconciler + HasTaskHandles {
+pub trait TaskOpsExt<T: 'static>: HasReconciler + TaskSpawner {
     fn start_task(&mut self, task: T) -> Option<TaskHandle> {
         let handle = self.alloc_task_handle();
         self.reconciler()
@@ -52,7 +52,7 @@ pub trait TaskOpsExt<T: 'static>: HasReconciler + HasTaskHandles {
     }
 }
 
-impl<T: 'static, Ctx> TaskOpsExt<T> for Ctx where Ctx: HasReconciler + HasTaskHandles {}
+impl<T: 'static, Ctx> TaskOpsExt<T> for Ctx where Ctx: HasReconciler + TaskSpawner {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompletion<O> {
