@@ -17,23 +17,22 @@ use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
 type Shared<T> = Rc<RefCell<T>>;
-type OperationInbox = Shared<VecDeque<Box<dyn Operation>>>;
 
 pub struct MachineHandle<E> {
-    inbox: OperationInbox,
+    reconciler: Shared<Reconciler>,
     _marker: PhantomData<fn(E)>,
 }
 
 impl<E> Clone for MachineHandle<E> {
     fn clone(&self) -> Self {
-        Self::new(self.inbox.clone())
+        Self::new(self.reconciler.clone())
     }
 }
 
 impl<E> MachineHandle<E> {
-    fn new(inbox: OperationInbox) -> Self {
+    fn new(reconciler: Shared<Reconciler>) -> Self {
         Self {
-            inbox,
+            reconciler,
             _marker: PhantomData,
         }
     }
@@ -42,7 +41,7 @@ impl<E> MachineHandle<E> {
     where
         O: Operation + 'static,
     {
-        self.inbox.borrow_mut().push_back(Box::new(op));
+        let _ = self.reconciler.borrow_mut().stage_boxed(Box::new(op), None);
     }
 }
 
@@ -53,7 +52,7 @@ impl<E: 'static> MachineHandle<E> {
 }
 
 pub struct Envelope<E, Context> {
-    pub context: Shared<Context>,
+    context: Shared<Context>,
     pub machine: MachineHandle<E>,
 }
 
@@ -67,11 +66,8 @@ impl<E, Context> Clone for Envelope<E, Context> {
 }
 
 impl<E, Context> Envelope<E, Context> {
-    fn new(ctx: Shared<Context>, machine: MachineHandle<E>) -> Self {
-        Self {
-            context: ctx,
-            machine,
-        }
+    fn new(context: Shared<Context>, machine: MachineHandle<E>) -> Self {
+        Self { context, machine }
     }
 
     pub fn context(&self) -> Ref<'_, Context> {
@@ -88,8 +84,7 @@ pub struct Machine<'a, 'b, T, E, Context> {
     behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
     current: State,
     context: Shared<Context>,
-    reconciler: Reconciler,
-    inbox: OperationInbox,
+    reconciler: Shared<Reconciler>,
     ready_events: SharedEventQueue<E>,
     consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
 }
@@ -101,7 +96,6 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         ctx: Context,
     ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
-        let inbox = Rc::new(RefCell::new(VecDeque::new()));
         let mut consumers = BTreeMap::new();
         consumers.insert(
             type_name::<EventOp<E>>(),
@@ -113,8 +107,7 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             behaviors,
             current: runner.tree.nil(),
             context: Rc::new(RefCell::new(ctx)),
-            reconciler: Reconciler::default(),
-            inbox,
+            reconciler: Rc::new(RefCell::new(Reconciler::default())),
             ready_events: ready_events.clone(),
             consumers,
         }
@@ -125,7 +118,10 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     }
 
     pub fn envelope(&self) -> Envelope<E, Context> {
-        Envelope::new(self.context.clone(), MachineHandle::new(self.inbox.clone()))
+        Envelope::new(
+            self.context.clone(),
+            MachineHandle::new(self.reconciler.clone()),
+        )
     }
 
     pub fn context(&self) -> Ref<'_, Context> {
@@ -225,15 +221,6 @@ impl<T, E: 'static, Context> Machine<'_, '_, T, E, Context>
 where
     StateTree<T>: TreeView,
 {
-    fn drain_inbox(&mut self) -> bool {
-        let mut drained = false;
-        while let Some(op) = self.inbox.borrow_mut().pop_front() {
-            drained = true;
-            let _ = self.reconciler.stage_boxed(op, None);
-        }
-        drained
-    }
-
     pub fn init(
         &mut self,
         target: State,
@@ -261,11 +248,11 @@ where
     /// dispatch resulting events until the machine becomes stable.
     pub fn advance(&mut self, on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>)) {
         loop {
-            let mut progressed = self.drain_inbox();
+            let mut progressed = false;
 
-            while self.reconciler.has_pending() {
+            while self.reconciler.borrow().has_pending() {
                 progressed = true;
-                self.reconciler.commit(|ticket, mut op| {
+                self.reconciler.borrow_mut().commit(|ticket, mut op| {
                     loop {
                         let key = op.operation_key();
 
@@ -284,16 +271,12 @@ where
 
             let mut drained_any = false;
             for consumer in self.consumers.values_mut() {
-                if consumer.drain(&mut self.reconciler) {
+                if consumer.drain(&mut self.reconciler.borrow_mut()) {
                     drained_any = true;
                 }
             }
 
             if drained_any {
-                continue;
-            }
-
-            if self.drain_inbox() {
                 continue;
             }
 
@@ -304,14 +287,9 @@ where
                         .dispatch(self.behaviors, &self.current, &event, self.envelope());
             }
 
-            if self.drain_inbox() {
-                continue;
-            }
-
             if !progressed
-                && !self.reconciler.has_pending()
+                && !self.reconciler.borrow().has_pending()
                 && self.ready_events.borrow().is_empty()
-                && self.inbox.borrow().is_empty()
             {
                 break;
             }
