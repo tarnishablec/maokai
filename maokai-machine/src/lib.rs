@@ -11,10 +11,10 @@ use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_gears::ops::task::{TaskHandle, TaskOp};
-#[cfg(feature = "tokio-local")]
+use maokai_gears::ops::task::{StopTaskOp, TaskHandle, TaskOp};
+#[cfg(feature = "tokio-local-task")]
 use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalTaskConsumer};
-#[cfg(feature = "tokio-mt")]
+#[cfg(feature = "tokio-mt-task")]
 use maokai_gears::runtime::tokio_mt::{SendTask, SendTaskMailboxSender, TokioMtTaskConsumer};
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
@@ -82,8 +82,21 @@ impl<E, Context> Envelope<E, Context> {
         self.context.borrow_mut()
     }
 
-    pub fn stop_task<T: 'static>(&self, handle: TaskHandle) {
-        self.machine.stage(TaskOp::<T>::Stop(handle));
+    pub fn stop_task(&self, handle: TaskHandle) {
+        self.machine.stage(StopTaskOp(handle));
+    }
+}
+
+#[cfg(feature = "tokio-mt-task")]
+pub struct SendTaskSpawner<E, Context> {
+    context: Shared<Context>,
+    machine: MachineHandle<E>,
+}
+
+#[cfg(feature = "tokio-mt-task")]
+impl<E, Context> SendTaskSpawner<E, Context> {
+    fn new(context: Shared<Context>, machine: MachineHandle<E>) -> Self {
+        Self { context, machine }
     }
 }
 
@@ -144,6 +157,13 @@ impl<E, Context> SendEnvelope<E, Context> {
     }
 }
 
+#[cfg(feature = "tokio-mt-task")]
+impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
+    pub fn send(&self) -> SendTaskSpawner<E, Context> {
+        SendTaskSpawner::new(self.context.clone(), self.machine.clone())
+    }
+}
+
 pub struct RequestTransitionOp {
     pub target: State,
 }
@@ -174,6 +194,32 @@ impl OpConsumer for RequestTransitionConsumer {
     }
 }
 
+pub struct StopTaskConsumer;
+
+impl OpConsumer for StopTaskConsumer {
+    fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
+        match downcast::Downcast::<StopTaskOp>::downcast(op) {
+            Ok(stop) => {
+                #[cfg(feature = "tokio-local-task")]
+                {
+                    let op: Box<dyn Operation> = Box::new(TaskOp::<LocalTask>::Stop(stop.0));
+                    OpFlow::Continue(op)
+                }
+                #[cfg(all(not(feature = "tokio-local-task"), feature = "tokio-mt-task"))]
+                {
+                    let op: Box<dyn Operation> = Box::new(TaskOp::<SendTask>::Stop(stop.0));
+                    OpFlow::Continue(op)
+                }
+                #[cfg(all(not(feature = "tokio-local-task"), not(feature = "tokio-mt-task")))]
+                {
+                    OpFlow::Consumed
+                }
+            }
+            Err(err) => OpFlow::Continue(err.into_object()),
+        }
+    }
+}
+
 pub struct Machine<'a, 'b, T, E, Context> {
     runner: &'a Runner<'a, T>,
     behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
@@ -192,9 +238,10 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         let _ = self.set_consumer::<RequestTransitionOp, _>(RequestTransitionConsumer::new(
             self.pending_transitions.clone(),
         ));
-        #[cfg(feature = "tokio-local")]
+        let _ = self.set_consumer::<StopTaskOp, _>(StopTaskConsumer);
+        #[cfg(feature = "tokio-local-task")]
         let _ = self.set_consumer::<TaskOp<LocalTask>, _>(TokioLocalTaskConsumer::default());
-        #[cfg(feature = "tokio-mt")]
+        #[cfg(feature = "tokio-mt-task")]
         let _ = self.set_consumer::<TaskOp<SendTask>, _>(TokioMtTaskConsumer::default());
     }
 
@@ -268,9 +315,9 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     }
 }
 
-#[cfg(feature = "tokio-local")]
+#[cfg(feature = "tokio-local-task")]
 impl<E: 'static, Context: 'static> Envelope<E, Context> {
-    pub fn start_local_task<F, Fut>(&self, build: F) -> TaskHandle
+    pub fn start_task<F, Fut>(&self, build: F) -> TaskHandle
     where
         F: FnOnce(Self) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
@@ -283,25 +330,21 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
         self.machine.stage(TaskOp::Start { handle, task });
         handle
     }
-
-    pub fn stop_local_task(&self, handle: TaskHandle) {
-        self.stop_task::<LocalTask>(handle);
-    }
 }
 
-#[cfg(feature = "tokio-mt")]
+#[cfg(feature = "tokio-mt-task")]
 struct MpscOpSink(SendTaskMailboxSender);
 
-#[cfg(feature = "tokio-mt")]
+#[cfg(feature = "tokio-mt-task")]
 impl SendOpSink for MpscOpSink {
     fn send_op(&self, op: Box<dyn Operation + Send>) {
         let _ = self.0.send(op);
     }
 }
 
-#[cfg(feature = "tokio-mt")]
-impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
-    pub fn start_send_task<F, Fut>(&self, build: F) -> TaskHandle
+#[cfg(feature = "tokio-mt-task")]
+impl<E, Context: Clone + Send + 'static> SendTaskSpawner<E, Context> {
+    pub fn start_task<F, Fut>(&self, build: F) -> TaskHandle
     where
         F: FnOnce(SendEnvelope<E, Context>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -323,9 +366,31 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
         self.machine.stage(TaskOp::Start { handle, task });
         handle
     }
+}
 
-    pub fn stop_send_task(&self, handle: TaskHandle) {
-        self.stop_task::<SendTask>(handle);
+#[cfg(feature = "tokio-mt-task")]
+impl<E, Context: Clone + Send + 'static> SendEnvelope<E, Context> {
+    pub fn start_task<F, Fut>(&self, build: F) -> TaskHandle
+    where
+        F: FnOnce(SendEnvelope<E, Context>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handle = TaskHandle::next();
+        let ctx = self.context.borrow().clone();
+        let task: SendTask = Box::new(move |emitter| {
+            let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
+            let envelope = SendEnvelope {
+                context: RefCell::new(ctx),
+                machine: SendMachineHandle {
+                    sink,
+                    _marker: PhantomData,
+                },
+            };
+            Box::pin(build(envelope))
+                as core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+        });
+        self.machine.stage(TaskOp::Start { handle, task });
+        handle
     }
 }
 
@@ -629,7 +694,7 @@ mod tests {
 
 // --- Tokio LocalSet integration tests ---
 
-#[cfg(all(test, feature = "tokio-local"))]
+#[cfg(all(test, feature = "tokio-local-task"))]
 mod tokio_local_tests {
     #![allow(clippy::unwrap_used)]
     extern crate std;
@@ -688,7 +753,7 @@ mod tokio_local_tests {
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:working");
-            let _ = envo.start_local_task(|envo| async move {
+            let _ = envo.start_task(|envo| async move {
                 envo.machine.post(Ev::TaskDone);
             });
         }
@@ -766,7 +831,7 @@ mod tokio_local_tests {
 
 // --- Tokio multi-thread integration tests ---
 
-#[cfg(all(test, feature = "tokio-mt"))]
+#[cfg(all(test, feature = "tokio-mt-task"))]
 mod tokio_mt_tests {
     #![allow(clippy::unwrap_used)]
     extern crate std;
@@ -827,7 +892,7 @@ mod tokio_mt_tests {
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context_mut().logs.push("enter:working");
-            let handle = envo.start_send_task(|envo| async move {
+            let handle = envo.send().start_task(|envo| async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 envo.machine.post(Ev::TaskDone);
             });
@@ -836,7 +901,7 @@ mod tokio_mt_tests {
         fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context_mut().logs.push("exit:working");
             if let Some(handle) = envo.context_mut().running_task.take() {
-                envo.stop_task::<SendTask>(handle);
+                envo.stop_task(handle);
             }
         }
         fn on_event(

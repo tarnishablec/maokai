@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["tokio-mt"]
-tokio-local = ["dep:tokio", "tokio/rt", "tokio/macros", "tokio/time", "maokai-gears/tokio-local"]
-tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", "tokio/time", "maokai-gears/tokio-mt"]
+default = ["tokio-mt-task"]
+tokio-local-task = ["dep:tokio", "tokio/rt", "tokio/macros", "tokio/time", "maokai-gears/tokio-local-task"]
+tokio-mt-task = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", "tokio/time", "maokai-gears/tokio-mt-task"]
 
 [dependencies]
 maokai-tree = { workspace = true }

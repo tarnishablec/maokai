@@ -11,6 +11,8 @@ use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use tokio::task::{JoinHandle, spawn_local};
 
 use crate::ops::task::*;
+#[cfg(feature = "tokio-mt-task")]
+use crate::runtime::tokio_mt::SendTask;
 
 type LocalTaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 pub type LocalTask = Box<dyn FnOnce(LocalTaskEmitter) -> LocalTaskFuture + 'static>;
@@ -72,6 +74,13 @@ impl OpConsumer for TokioLocalTaskConsumer {
                     TaskOp::Stop(handle) => {
                         if let Some(running) = self.running.remove(&handle) {
                             running.abort();
+                        } else {
+                            #[cfg(feature = "tokio-mt-task")]
+                            {
+                                let op: Box<dyn Operation> =
+                                    Box::new(TaskOp::<SendTask>::Stop(handle));
+                                return OpFlow::Continue(op);
+                            }
                         }
                     }
                 }
