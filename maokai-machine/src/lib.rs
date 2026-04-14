@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::any::type_name;
 use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
@@ -70,6 +71,63 @@ impl<E, Context> Envelope<E, Context> {
         Self { context, machine }
     }
 
+    pub fn context(&self) -> Ref<'_, Context> {
+        self.context.borrow()
+    }
+
+    pub fn context_mut(&self) -> RefMut<'_, Context> {
+        self.context.borrow_mut()
+    }
+}
+
+pub trait SendOpSink: Send + Sync + 'static {
+    fn send_op(&self, op: Box<dyn Operation + Send>);
+}
+
+pub struct SendMachineHandle<E> {
+    sink: Arc<dyn SendOpSink>,
+    _marker: PhantomData<fn(E)>,
+}
+
+impl<E> Clone for SendMachineHandle<E> {
+    fn clone(&self) -> Self {
+        Self {
+            sink: self.sink.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<E> SendMachineHandle<E> {
+    pub fn dispatch<O>(&self, op: O)
+    where
+        O: Operation + Send + 'static,
+    {
+        self.sink.send_op(Box::new(op));
+    }
+}
+
+impl<E: Send + 'static> SendMachineHandle<E> {
+    pub fn post(&self, event: E) {
+        self.dispatch(EventOp::Emit(event));
+    }
+}
+
+pub struct SendEnvelope<E, Context> {
+    context: RefCell<Context>,
+    pub machine: SendMachineHandle<E>,
+}
+
+impl<E, Context: Clone> Clone for SendEnvelope<E, Context> {
+    fn clone(&self) -> Self {
+        Self {
+            context: RefCell::new(self.context.borrow().clone()),
+            machine: self.machine.clone(),
+        }
+    }
+}
+
+impl<E, Context> SendEnvelope<E, Context> {
     pub fn context(&self) -> Ref<'_, Context> {
         self.context.borrow()
     }
@@ -192,18 +250,36 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
 }
 
 #[cfg(feature = "tokio-mt")]
+struct MpscOpSink<O>(maokai_gears::runtime::tokio_mt::SendTaskMailboxSender<O>);
+
+#[cfg(feature = "tokio-mt")]
+impl<O: Send + 'static> SendOpSink for MpscOpSink<O> {
+    fn send_op(&self, op: Box<dyn Operation + Send>) {
+        use maokai_gears::ops::task::TaskMailboxSender;
+        TaskMailboxSender::send_op(&self.0, op);
+    }
+}
+
+#[cfg(feature = "tokio-mt")]
 impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
     pub fn start_send_task<O: Send + 'static, F, Fut>(&self, build: F) -> TaskHandle
     where
-        F: FnOnce(maokai_gears::runtime::tokio_mt::SendTaskCtx<Context, O>) -> Fut + Send + 'static,
+        F: FnOnce(SendEnvelope<E, Context>) -> Fut + Send + 'static,
         Fut: Future<Output = O> + Send + 'static,
     {
         let handle = TaskHandle::next();
         let ctx = self.context.borrow().clone();
-        let task: maokai_gears::runtime::tokio_mt::SendTask<O> = Box::new(move |emit| {
-            Box::pin(build(maokai_gears::runtime::tokio_mt::SendTaskCtx::new(
-                ctx, emit,
-            ))) as core::pin::Pin<Box<dyn Future<Output = O> + Send + 'static>>
+        let task: maokai_gears::runtime::tokio_mt::SendTask<O> = Box::new(move |emitter| {
+            let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
+            let envelope = SendEnvelope {
+                context: RefCell::new(ctx),
+                machine: SendMachineHandle {
+                    sink,
+                    _marker: PhantomData,
+                },
+            };
+            Box::pin(build(envelope))
+                as core::pin::Pin<Box<dyn Future<Output = O> + Send + 'static>>
         });
         self.machine
             .dispatch(maokai_gears::ops::task::TaskOp::Start { handle, task });
@@ -720,14 +796,14 @@ mod tokio_mt_tests {
 
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
-            envo.context.borrow_mut().logs.push("enter:working");
-            let _ = envo.start_send_task(|task_ctx| async move {
-                task_ctx.emit(EventOp::Emit(Ev::TaskDone));
+            envo.context_mut().logs.push("enter:working");
+            let _ = envo.start_send_task(|envo| async move {
+                envo.machine.post(Ev::TaskDone);
                 "result"
             });
         }
         fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
-            envo.context.borrow_mut().logs.push("exit:working");
+            envo.context_mut().logs.push("exit:working");
         }
         fn on_event(
             &self,

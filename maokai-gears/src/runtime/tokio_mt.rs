@@ -13,24 +13,6 @@ pub type SendTaskMailboxSender<O> = mpsc::UnboundedSender<TaskOutput<O>>;
 pub type SendTaskMailboxSource<O> = mpsc::UnboundedReceiver<TaskOutput<O>>;
 pub type SendTaskEmitter<O> = TaskEmitter<SendTaskMailboxSender<O>, O>;
 
-pub struct SendTaskCtx<Context, O> {
-    pub ctx: Context,
-    emitter: SendTaskEmitter<O>,
-}
-
-impl<Context, O: Send> SendTaskCtx<Context, O> {
-    pub fn new(ctx: Context, emitter: SendTaskEmitter<O>) -> Self {
-        Self { ctx, emitter }
-    }
-
-    pub fn emit<Op>(&self, op: Op)
-    where
-        Op: maokai_reconciler::Operation + Send + 'static,
-    {
-        self.emitter.emit(op);
-    }
-}
-
 fn completion_channel<O>() -> (SendTaskMailboxSender<O>, SendTaskMailboxSource<O>) {
     mpsc::unbounded_channel()
 }

@@ -25,24 +25,6 @@ pub struct LocalTaskMailboxSource<O>(LocalTaskMailbox<O>);
 
 pub type LocalTaskEmitter<O> = TaskEmitter<LocalTaskMailboxSender<O>, O>;
 
-pub struct LocalTaskCtx<Context, O> {
-    pub ctx: Context,
-    emitter: LocalTaskEmitter<O>,
-}
-
-impl<Context, O> LocalTaskCtx<Context, O> {
-    pub fn new(ctx: Context, emitter: LocalTaskEmitter<O>) -> Self {
-        Self { ctx, emitter }
-    }
-
-    pub fn emit<Op>(&self, op: Op)
-    where
-        Op: maokai_reconciler::Operation + Send + 'static,
-    {
-        self.emitter.emit(op);
-    }
-}
-
 impl<O> TaskMailboxSender<O> for LocalTaskMailboxSender<O> {
     fn send_op(&self, op: Box<dyn maokai_reconciler::Operation + Send>) {
         self.0.borrow_mut().push_back(TaskOutput::Operation(op));

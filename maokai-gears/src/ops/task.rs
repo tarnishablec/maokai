@@ -64,6 +64,10 @@ impl<S, O> TaskEmitter<S, O> {
             _marker: PhantomData,
         }
     }
+
+    pub fn into_sender(self) -> S {
+        self.sender
+    }
 }
 
 impl<S: Clone, O> Clone for TaskEmitter<S, O> {
