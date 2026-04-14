@@ -11,7 +11,6 @@ use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-#[cfg(any(feature = "tokio-local", feature = "tokio-mt"))]
 use maokai_gears::ops::task::{TaskHandle, TaskOp};
 #[cfg(feature = "tokio-local")]
 use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalTaskConsumer};
@@ -81,6 +80,10 @@ impl<E, Context> Envelope<E, Context> {
 
     pub fn context_mut(&self) -> RefMut<'_, Context> {
         self.context.borrow_mut()
+    }
+
+    pub fn stop_task<T: 'static>(&self, handle: TaskHandle) {
+        self.machine.stage(TaskOp::<T>::Stop(handle));
     }
 }
 
@@ -274,18 +277,15 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
     {
         let handle = TaskHandle::next();
         let envelop = self.clone();
-        let task: maokai_gears::runtime::tokio_local::LocalTask = Box::new(move |_| {
+        let task: LocalTask = Box::new(move |_| {
             Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>
         });
-        self.machine
-            .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
+        self.machine.stage(TaskOp::Start { handle, task });
         handle
     }
 
     pub fn stop_local_task(&self, handle: TaskHandle) {
-        self.machine.stage(maokai_gears::ops::task::TaskOp::<
-            maokai_gears::runtime::tokio_local::LocalTask,
-        >::Stop(handle));
+        self.stop_task::<LocalTask>(handle);
     }
 }
 
@@ -308,7 +308,7 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
     {
         let handle = TaskHandle::next();
         let ctx = self.context.borrow().clone();
-        let task: maokai_gears::runtime::tokio_mt::SendTask = Box::new(move |emitter| {
+        let task: SendTask = Box::new(move |emitter| {
             let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
             let envelope = SendEnvelope {
                 context: RefCell::new(ctx),
@@ -320,15 +320,12 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
             Box::pin(build(envelope))
                 as core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
         });
-        self.machine
-            .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
+        self.machine.stage(TaskOp::Start { handle, task });
         handle
     }
 
     pub fn stop_send_task(&self, handle: TaskHandle) {
-        self.machine.stage(maokai_gears::ops::task::TaskOp::<
-            maokai_gears::runtime::tokio_mt::SendTask,
-        >::Stop(handle));
+        self.stop_task::<SendTask>(handle);
     }
 }
 
@@ -784,12 +781,14 @@ mod tokio_mt_tests {
     #[derive(Debug)]
     enum Ev {
         Go,
+        Back,
         TaskDone,
     }
 
     #[derive(Clone)]
     struct Context {
         logs: Vec<&'static str>,
+        running_task: Option<TaskHandle>,
     }
 
     static TREE: LazyLock<(StateTree<&str>, State, State)> = LazyLock::new(|| {
@@ -828,12 +827,17 @@ mod tokio_mt_tests {
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context_mut().logs.push("enter:working");
-            let _ = envo.start_send_task(|envo| async move {
+            let handle = envo.start_send_task(|envo| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 envo.machine.post(Ev::TaskDone);
             });
+            envo.context_mut().running_task = Some(handle);
         }
         fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context_mut().logs.push("exit:working");
+            if let Some(handle) = envo.context_mut().running_task.take() {
+                envo.stop_task::<SendTask>(handle);
+            }
         }
         fn on_event(
             &self,
@@ -843,6 +847,7 @@ mod tokio_mt_tests {
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
+                Ev::Back => EventReply::Transition(TREE.1),
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
                     EventReply::Transition(TREE.1)
@@ -863,7 +868,14 @@ mod tokio_mt_tests {
 
     #[tokio::test]
     async fn task_spawns_on_enter_and_posts_back() {
-        let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() });
+        let mut machine = Machine::new(
+            &RUNNER,
+            &BEHAVIORS,
+            Context {
+                logs: Vec::new(),
+                running_task: None,
+            },
+        );
         let (_, idle, working) = &*TREE;
         machine.init(*idle);
         assert_eq!(machine.current(), *idle);
@@ -891,6 +903,47 @@ mod tokio_mt_tests {
                 "exit:idle",
                 "enter:working",
                 "task:done",
+                "exit:working",
+                "enter:idle"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_started_on_enter_is_aborted_on_exit() {
+        let mut machine = Machine::new(
+            &RUNNER,
+            &BEHAVIORS,
+            Context {
+                logs: Vec::new(),
+                running_task: None,
+            },
+        );
+        let (_, idle, working) = &*TREE;
+        machine.init(*idle);
+        assert_eq!(machine.current(), *idle);
+
+        machine.post(Ev::Go);
+        machine.advance();
+        assert_eq!(machine.current(), *working);
+
+        machine.post(Ev::Back);
+        machine.advance();
+        assert_eq!(machine.current(), *idle);
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        for _ in 0..4 {
+            machine.advance();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(machine.current(), *idle);
+        assert_eq!(
+            machine.context().logs,
+            vec![
+                "enter:idle",
+                "exit:idle",
+                "enter:working",
                 "exit:working",
                 "enter:idle"
             ]
