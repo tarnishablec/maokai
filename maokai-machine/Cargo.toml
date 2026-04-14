@@ -13,6 +13,7 @@ maokai-tree = { workspace = true }
 maokai-runner = { workspace = true }
 maokai-reconciler = { workspace = true }
 maokai-gears = { workspace = true }
+downcast = { workspace = true }
 tokio = { workspace = true, optional = true }
 
 [lints]

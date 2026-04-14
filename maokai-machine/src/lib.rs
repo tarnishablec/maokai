@@ -38,7 +38,7 @@ impl<E> MachineHandle<E> {
         }
     }
 
-    pub fn dispatch<O>(&self, op: O)
+    pub fn stage<O>(&self, op: O)
     where
         O: Operation + 'static,
     {
@@ -48,7 +48,7 @@ impl<E> MachineHandle<E> {
 
 impl<E: 'static> MachineHandle<E> {
     pub fn post(&self, event: E) {
-        self.dispatch(EventOp::Emit(event));
+        self.stage(EventOp::Emit(event));
     }
 }
 
@@ -99,7 +99,7 @@ impl<E> Clone for SendMachineHandle<E> {
 }
 
 impl<E> SendMachineHandle<E> {
-    pub fn dispatch<O>(&self, op: O)
+    pub fn stage<O>(&self, op: O)
     where
         O: Operation + Send + 'static,
     {
@@ -109,7 +109,7 @@ impl<E> SendMachineHandle<E> {
 
 impl<E: Send + 'static> SendMachineHandle<E> {
     pub fn post(&self, event: E) {
-        self.dispatch(EventOp::Emit(event));
+        self.stage(EventOp::Emit(event));
     }
 }
 
@@ -137,6 +137,36 @@ impl<E, Context> SendEnvelope<E, Context> {
     }
 }
 
+pub struct RequestTransitionOp {
+    pub target: State,
+}
+
+impl Operation for RequestTransitionOp {}
+
+type SharedTransitionQueue = Shared<VecDeque<State>>;
+
+pub struct RequestTransitionConsumer {
+    queue: SharedTransitionQueue,
+}
+
+impl RequestTransitionConsumer {
+    pub fn new(queue: SharedTransitionQueue) -> Self {
+        Self { queue }
+    }
+}
+
+impl OpConsumer for RequestTransitionConsumer {
+    fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
+        match downcast::Downcast::<RequestTransitionOp>::downcast(op) {
+            Ok(req) => {
+                self.queue.borrow_mut().push_back(req.target);
+                OpFlow::Consumed
+            }
+            Err(err) => OpFlow::Continue(err.into_object()),
+        }
+    }
+}
+
 pub struct Machine<'a, 'b, T, E, Context> {
     runner: &'a Runner<'a, T>,
     behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
@@ -144,6 +174,7 @@ pub struct Machine<'a, 'b, T, E, Context> {
     context: Shared<Context>,
     reconciler: Shared<Reconciler>,
     ready_events: SharedEventQueue<E>,
+    pending_transitions: SharedTransitionQueue,
     consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
 }
 
@@ -154,10 +185,16 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         ctx: Context,
     ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
+        let pending_transitions = Rc::new(RefCell::new(VecDeque::new()));
         let mut consumers = BTreeMap::new();
         consumers.insert(
             type_name::<EventOp<E>>(),
             Box::new(EventOpConsumer::<E>::new(ready_events.clone())) as Box<dyn OpConsumer>,
+        );
+        consumers.insert(
+            type_name::<RequestTransitionOp>(),
+            Box::new(RequestTransitionConsumer::new(pending_transitions.clone()))
+                as Box<dyn OpConsumer>,
         );
 
         Self {
@@ -166,7 +203,8 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             current: runner.tree.nil(),
             context: Rc::new(RefCell::new(ctx)),
             reconciler: Rc::new(RefCell::new(Reconciler::default())),
-            ready_events: ready_events.clone(),
+            ready_events,
+            pending_transitions,
             consumers,
         }
     }
@@ -220,6 +258,12 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             type_name::<EventOp<E>>(),
             Box::new(EventOpConsumer::<E>::new(self.ready_events.clone())),
         );
+        self.consumers.insert(
+            type_name::<RequestTransitionOp>(),
+            Box::new(RequestTransitionConsumer::new(
+                self.pending_transitions.clone(),
+            )),
+        );
     }
 }
 
@@ -238,12 +282,12 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
             },
         );
         self.machine
-            .dispatch(maokai_gears::ops::task::TaskOp::Start { handle, task });
+            .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
         handle
     }
 
     pub fn stop_local_task<O: 'static>(&self, handle: TaskHandle) {
-        self.machine.dispatch(maokai_gears::ops::task::TaskOp::<
+        self.machine.stage(maokai_gears::ops::task::TaskOp::<
             maokai_gears::runtime::tokio_local::LocalTask<O>,
         >::Stop(handle));
     }
@@ -282,12 +326,12 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
                 as core::pin::Pin<Box<dyn Future<Output = O> + Send + 'static>>
         });
         self.machine
-            .dispatch(maokai_gears::ops::task::TaskOp::Start { handle, task });
+            .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
         handle
     }
 
     pub fn stop_send_task<O: Send + 'static>(&self, handle: TaskHandle) {
-        self.machine.dispatch(maokai_gears::ops::task::TaskOp::<
+        self.machine.stage(maokai_gears::ops::task::TaskOp::<
             maokai_gears::runtime::tokio_mt::SendTask<O>,
         >::Stop(handle));
     }
@@ -297,7 +341,11 @@ impl<T, E: 'static, Context> Machine<'_, '_, T, E, Context>
 where
     StateTree<T>: TreeView,
 {
-    pub fn init(
+    pub fn init(&mut self, target: State) -> bool {
+        self.init_with(target, &mut |_, _| {})
+    }
+
+    pub fn init_with(
         &mut self,
         target: State,
         on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>),
@@ -306,11 +354,10 @@ where
             return false;
         }
 
-        let envo = self.envelope();
-        self.current = self
-            .runner
-            .transition(self.behaviors, &self.current, &target, envo);
-        self.advance(on_unhandled);
+        self.envelope()
+            .machine
+            .stage(RequestTransitionOp { target });
+        self.advance_with(on_unhandled);
         true
     }
 
@@ -322,7 +369,11 @@ where
 
     /// Commit staged operations, route them through the machine's consumers, and
     /// dispatch resulting events until the machine becomes stable.
-    pub fn advance(&mut self, on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>)) {
+    pub fn advance(&mut self) {
+        self.advance_with(&mut |_, _| {});
+    }
+
+    pub fn advance_with(&mut self, on_unhandled: &mut impl FnMut(Ticket, Box<dyn Operation>)) {
         loop {
             let mut progressed = false;
 
@@ -356,6 +407,14 @@ where
                 continue;
             }
 
+            while let Some(target) = self.pending_transitions.borrow_mut().pop_front() {
+                progressed = true;
+                let envo = self.envelope();
+                self.current = self
+                    .runner
+                    .transition(self.behaviors, &self.current, &target, envo);
+            }
+
             while let Some(event) = self.ready_events.borrow_mut().pop_front() {
                 progressed = true;
                 self.current =
@@ -366,6 +425,7 @@ where
             if !progressed
                 && !self.reconciler.borrow().has_pending()
                 && self.ready_events.borrow().is_empty()
+                && self.pending_transitions.borrow().is_empty()
             {
                 break;
             }
@@ -495,9 +555,6 @@ mod tests {
         Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
     }
 
-    /// No-op commit handler for tests that don't produce non-event operations.
-    fn noop(_: Ticket, _: Box<dyn Operation>) {}
-
     // --- Basic Machine tests ---
 
     #[test]
@@ -505,12 +562,12 @@ mod tests {
         let mut machine = new_machine();
 
         let (_, closed, _, _) = &*SETUP_TREE;
-        machine.init(*closed, &mut noop);
+        machine.init(*closed);
         assert_eq!(machine.current(), *closed);
         assert_eq!(machine.context().logs, alloc::vec!["enter:closed"]);
 
         machine.post(LightEvent::Open);
-        machine.advance(&mut noop);
+        machine.advance();
 
         let (_, _, opened, _) = &*SETUP_TREE;
         assert_eq!(machine.current(), *opened);
@@ -524,11 +581,11 @@ mod tests {
     fn event_bubbles_from_child_to_parent() {
         let mut machine = new_machine();
         let (_, _, _, shining) = &*SETUP_TREE;
-        machine.init(*shining, &mut noop);
+        machine.init(*shining);
 
         // Close is Ignored by ShiningBehavior → bubbles to OpenedBehavior → Transition(closed)
         machine.post(LightEvent::Close);
-        machine.advance(&mut noop);
+        machine.advance();
 
         let (_, closed, _, _) = &*SETUP_TREE;
         assert_eq!(machine.current(), *closed);
@@ -548,10 +605,10 @@ mod tests {
     fn shine_transitions_into_child_state() {
         let mut machine = new_machine();
         let (_, _, opened, shining) = &*SETUP_TREE;
-        machine.init(*opened, &mut noop);
+        machine.init(*opened);
 
         machine.post(LightEvent::Shine);
-        machine.advance(&mut noop);
+        machine.advance();
 
         assert_eq!(machine.current(), *shining);
         assert_eq!(
@@ -564,11 +621,11 @@ mod tests {
     fn cloned_envelope_can_post_back_into_machine() {
         let mut machine = new_machine();
         let (_, closed, opened, _) = &*SETUP_TREE;
-        machine.init(*closed, &mut noop);
+        machine.init(*closed);
 
         let envo = machine.envelope();
         envo.machine.post(LightEvent::Open);
-        machine.advance(&mut noop);
+        machine.advance();
 
         assert_eq!(machine.current(), *opened);
         assert_eq!(
@@ -674,8 +731,6 @@ mod tokio_local_tests {
             b
         });
 
-    fn noop(_: Ticket, _: Box<dyn Operation>) {}
-
     #[tokio::test]
     async fn task_spawns_on_enter_and_completion_feeds_back() {
         let local = tokio::task::LocalSet::new();
@@ -695,19 +750,19 @@ mod tokio_local_tests {
                         }),
                     );
                 let (_, idle, working) = &*TREE;
-                machine.init(*idle, &mut noop);
+                machine.init(*idle);
                 assert_eq!(machine.current(), *idle);
 
                 // Go → working, on_enter stages TaskOp
                 machine.post(Ev::Go);
-                machine.advance(&mut noop);
+                machine.advance();
                 assert_eq!(machine.current(), *working);
 
                 // Yield to let spawned local task complete and let the machine drain it.
                 tokio::task::yield_now().await;
 
                 for _ in 0..8 {
-                    machine.advance(&mut noop);
+                    machine.advance();
                     if machine.current() == *idle {
                         break;
                     }
@@ -831,8 +886,6 @@ mod tokio_mt_tests {
             b
         });
 
-    fn noop(_: Ticket, _: Box<dyn Operation>) {}
-
     #[tokio::test]
     async fn task_spawns_on_enter_and_completion_feeds_back() {
         let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
@@ -847,18 +900,18 @@ mod tokio_mt_tests {
                 },
             ));
         let (_, idle, working) = &*TREE;
-        machine.init(*idle, &mut noop);
+        machine.init(*idle);
         assert_eq!(machine.current(), *idle);
 
         // Go → working, on_enter stages TaskOp
         machine.post(Ev::Go);
-        machine.advance(&mut noop);
+        machine.advance();
         assert_eq!(machine.current(), *working);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         for _ in 0..8 {
-            machine.advance(&mut noop);
+            machine.advance();
             if machine.current() == *idle {
                 break;
             }

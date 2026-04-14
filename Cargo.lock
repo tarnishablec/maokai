@@ -10,9 +10,9 @@ checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
 name = "indextree"
-version = "4.7.4"
+version = "4.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb9e21e48c85fa6643a38caca564645a3bbc9211edf506fc8ed690c7e7b4d3c7"
+checksum = "5cee462cd93b03891663339b59a21246cc5fc2cc95060d0bb5059e25cd50edc4"
 
 [[package]]
 name = "maokai-gears"
@@ -27,6 +27,7 @@ dependencies = [
 name = "maokai-machine"
 version = "0.1.0"
 dependencies = [
+ "downcast",
  "maokai-gears",
  "maokai-reconciler",
  "maokai-runner",
