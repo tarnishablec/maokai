@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use core::any::type_name;
 use core::pin::Pin;
 use downcast::Downcast;
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
@@ -42,47 +43,60 @@ fn task_channel() -> (SendTaskMailboxSender, SendTaskMailboxSource) {
     mpsc::unbounded_channel()
 }
 
-pub struct TokioMtTaskConsumer {
+struct MtTaskRuntime {
     running: BTreeMap<TaskHandle, JoinHandle<()>>,
     sender: SendTaskMailboxSender,
     source: SendTaskMailboxSource,
+}
+
+pub struct TokioMtTaskConsumer {
+    runtime: MtTaskRuntime,
 }
 
 impl Default for TokioMtTaskConsumer {
     fn default() -> Self {
         let (sender, source) = task_channel();
         Self {
-            running: BTreeMap::new(),
-            sender,
-            source,
+            runtime: MtTaskRuntime {
+                running: BTreeMap::new(),
+                sender,
+                source,
+            },
         }
     }
 }
 
 impl OpConsumer for TokioMtTaskConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match Downcast::<TaskOp<SendTask>>::downcast(op) {
-            Ok(task_op) => {
-                match *task_op {
-                    TaskOp::Start { handle, task } => {
-                        let running = tokio::spawn(task(SendTaskEmitter::new(self.sender.clone())));
-                        self.running.insert(handle, running);
+        match op.operation_key() {
+            key if key == type_name::<StartTaskOp<SendTask>>() => {
+                match Downcast::<StartTaskOp<SendTask>>::downcast(op) {
+                    Ok(task_op) => {
+                        let StartTaskOp { handle, task } = *task_op;
+                        let sender = self.runtime.sender.clone();
+                        let running = tokio::spawn(task(SendTaskEmitter::new(sender)));
+                        self.runtime.running.insert(handle, running);
+                        OpFlow::Consumed
                     }
-                    TaskOp::Stop(handle) => {
-                        if let Some(running) = self.running.remove(&handle) {
-                            running.abort();
-                        }
-                    }
+                    Err(err) => OpFlow::Continue(err.into_object()),
                 }
-                OpFlow::Consumed
             }
-            Err(err) => OpFlow::Continue(err.into_object()),
+            key if key == type_name::<StopTaskOp>() => match Downcast::<StopTaskOp>::downcast(op) {
+                Ok(stop) => {
+                    if let Some(running) = self.runtime.running.remove(&stop.0) {
+                        running.abort();
+                    }
+                    OpFlow::Consumed
+                }
+                Err(err) => OpFlow::Continue(err.into_object()),
+            },
+            _ => OpFlow::Continue(op),
         }
     }
 
     fn drain(&mut self, reconciler: &mut Reconciler) -> bool {
         let mut drained = false;
-        while let Ok(op) = self.source.try_recv() {
+        while let Ok(op) = self.runtime.source.try_recv() {
             drained = true;
             let op: Box<dyn Operation> = op;
             let _ = reconciler.stage_boxed(op, None);

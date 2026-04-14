@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
+use core::any::type_name;
 use core::cell::RefCell;
 use core::pin::Pin;
 use downcast::Downcast;
@@ -11,8 +12,6 @@ use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use tokio::task::{JoinHandle, spawn_local};
 
 use crate::ops::task::*;
-#[cfg(feature = "tokio-mt-task")]
-use crate::runtime::tokio_mt::SendTask;
 
 type LocalTaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 pub type LocalTask = Box<dyn FnOnce(LocalTaskEmitter) -> LocalTaskFuture + 'static>;
@@ -45,54 +44,70 @@ fn task_channel() -> (LocalTaskMailboxSender, LocalTaskMailboxSource) {
     (LocalTaskMailboxSender(q.clone()), LocalTaskMailboxSource(q))
 }
 
-pub struct TokioLocalTaskConsumer {
+struct LocalTaskRuntime {
     running: BTreeMap<TaskHandle, JoinHandle<()>>,
     sender: LocalTaskMailboxSender,
     source: LocalTaskMailboxSource,
+}
+
+pub struct TokioLocalTaskConsumer {
+    runtime: LocalTaskRuntime,
 }
 
 impl Default for TokioLocalTaskConsumer {
     fn default() -> Self {
         let (sender, source) = task_channel();
         Self {
-            running: BTreeMap::new(),
-            sender,
-            source,
+            runtime: LocalTaskRuntime {
+                running: BTreeMap::new(),
+                sender,
+                source,
+            },
         }
     }
 }
 
 impl OpConsumer for TokioLocalTaskConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match Downcast::<TaskOp<LocalTask>>::downcast(op) {
-            Ok(task_op) => {
-                match *task_op {
-                    TaskOp::Start { handle, task } => {
-                        let running = spawn_local(task(LocalTaskEmitter::new(self.sender.clone())));
-                        self.running.insert(handle, running);
+        match op.operation_key() {
+            key if key == type_name::<StartTaskOp<LocalTask>>() => {
+                match Downcast::<StartTaskOp<LocalTask>>::downcast(op) {
+                    Ok(task_op) => {
+                        let StartTaskOp { handle, task } = *task_op;
+                        let sender = self.runtime.sender.clone();
+                        let running = spawn_local(task(LocalTaskEmitter::new(sender)));
+                        self.runtime.running.insert(handle, running);
+                        OpFlow::Consumed
                     }
-                    TaskOp::Stop(handle) => {
-                        if let Some(running) = self.running.remove(&handle) {
-                            running.abort();
-                        } else {
-                            #[cfg(feature = "tokio-mt-task")]
-                            {
-                                let op: Box<dyn Operation> =
-                                    Box::new(TaskOp::<SendTask>::Stop(handle));
-                                return OpFlow::Continue(op);
-                            }
+                    Err(err) => OpFlow::Continue(err.into_object()),
+                }
+            }
+            key if key == type_name::<StopTaskOp>() => match Downcast::<StopTaskOp>::downcast(op) {
+                Ok(stop) => {
+                    if let Some(running) = self.runtime.running.remove(&stop.0) {
+                        running.abort();
+                        OpFlow::Consumed
+                    } else {
+                        #[cfg(feature = "tokio-mt-task")]
+                        {
+                            let op: Box<dyn Operation> = Box::new(StopTaskOp(stop.0));
+                            OpFlow::Continue(op)
+                        }
+                        #[cfg(not(feature = "tokio-mt-task"))]
+                        {
+                            OpFlow::Consumed
                         }
                     }
                 }
-                OpFlow::Consumed
-            }
-            Err(err) => OpFlow::Continue(err.into_object()),
+                Err(err) => OpFlow::Continue(err.into_object()),
+            },
+            _ => OpFlow::Continue(op),
         }
     }
 
     fn drain(&mut self, reconciler: &mut Reconciler) -> bool {
         let mut drained = false;
-        while let Some(op) = self.source.0.borrow_mut().pop_front() {
+        while let Some(op) = self.runtime.source.0.borrow_mut().pop_front() {
             drained = true;
             let op: Box<dyn Operation> = op;
             let _ = reconciler.stage_boxed(op, None);

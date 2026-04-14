@@ -11,12 +11,12 @@ impl TaskHandle {
     }
 }
 
-pub enum TaskOp<T> {
-    Start { handle: TaskHandle, task: T },
-    Stop(TaskHandle),
+pub struct StartTaskOp<T> {
+    pub handle: TaskHandle,
+    pub task: T,
 }
 
-impl<T: 'static> Operation for TaskOp<T> {}
+impl<T: 'static> Operation for StartTaskOp<T> {}
 
 pub struct StopTaskOp(pub TaskHandle);
 
@@ -26,7 +26,7 @@ pub trait TaskOpsExt<T: 'static>: HasReconciler {
     fn start_task(&mut self, task: T) -> Option<TaskHandle> {
         let handle = TaskHandle::next();
         self.reconciler()
-            .stage(TaskOp::Start { handle, task }, None)
+            .stage(StartTaskOp { handle, task }, None)
             .map(|_| handle)
     }
 

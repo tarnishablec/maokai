@@ -118,7 +118,8 @@ Each consumer is responsible for one operation family. A consumer may:
 - drain externally-produced work back into the reconciler
 
 This design lets the machine remain generic while still supporting rich integrations. A task system, for example, is
-just another consumer that understands `TaskOp` and later drains task-produced operations back into the reconciler.
+just another consumer family that understands task start and stop operations and later drains task-produced operations
+back into the reconciler.
 
 Because consumers are registered by operation type, the machine itself does not need to know the meaning of those
 operations ahead of time.

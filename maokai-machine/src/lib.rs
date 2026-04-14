@@ -6,12 +6,13 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::type_name;
 use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
-use maokai_gears::ops::task::{StopTaskOp, TaskHandle, TaskOp};
+use maokai_gears::ops::task::{StartTaskOp, StopTaskOp, TaskHandle};
 #[cfg(feature = "tokio-local-task")]
 use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalTaskConsumer};
 #[cfg(feature = "tokio-mt-task")]
@@ -194,31 +195,29 @@ impl OpConsumer for RequestTransitionConsumer {
     }
 }
 
-pub struct StopTaskConsumer;
-
-impl OpConsumer for StopTaskConsumer {
-    fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match downcast::Downcast::<StopTaskOp>::downcast(op) {
-            Ok(stop) => {
-                #[cfg(feature = "tokio-local-task")]
-                {
-                    let op: Box<dyn Operation> = Box::new(TaskOp::<LocalTask>::Stop(stop.0));
-                    OpFlow::Continue(op)
-                }
-                #[cfg(all(not(feature = "tokio-local-task"), feature = "tokio-mt-task"))]
-                {
-                    let op: Box<dyn Operation> = Box::new(TaskOp::<SendTask>::Stop(stop.0));
-                    OpFlow::Continue(op)
-                }
-                #[cfg(all(not(feature = "tokio-local-task"), not(feature = "tokio-mt-task")))]
-                {
-                    OpFlow::Consumed
-                }
-            }
-            Err(err) => OpFlow::Continue(err.into_object()),
-        }
-    }
+pub trait ConsumerOpList {
+    fn keys() -> Vec<&'static str>;
 }
+
+macro_rules! impl_consumer_ops_tuple {
+    ($($name:ident),+ $(,)?) => {
+        impl<$($name),+> ConsumerOpList for ($($name,)+)
+        where
+            $($name: Operation + 'static),+
+        {
+            fn keys() -> Vec<&'static str> {
+                alloc::vec![$(type_name::<$name>()),+]
+            }
+        }
+    };
+}
+
+impl_consumer_ops_tuple!(A, B);
+impl_consumer_ops_tuple!(A, B, C);
+impl_consumer_ops_tuple!(A, B, C, D);
+impl_consumer_ops_tuple!(A);
+
+type SharedConsumer = Rc<RefCell<dyn OpConsumer>>;
 
 pub struct Machine<'a, 'b, T, E, Context> {
     runner: &'a Runner<'a, T>,
@@ -228,21 +227,27 @@ pub struct Machine<'a, 'b, T, E, Context> {
     reconciler: Shared<Reconciler>,
     ready_events: SharedEventQueue<E>,
     pending_transitions: SharedTransitionQueue,
-    consumers: BTreeMap<&'static str, Box<dyn OpConsumer>>,
+    consumers: BTreeMap<&'static str, Vec<SharedConsumer>>,
 }
 
 impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     fn install_default_consumers(&mut self) {
-        let _ = self
-            .set_consumer::<EventOp<E>, _>(EventOpConsumer::<E>::new(self.ready_events.clone()));
-        let _ = self.set_consumer::<RequestTransitionOp, _>(RequestTransitionConsumer::new(
+        self.set_consumer::<(EventOp<E>,), _>(EventOpConsumer::<E>::new(self.ready_events.clone()));
+        self.set_consumer::<(RequestTransitionOp,), _>(RequestTransitionConsumer::new(
             self.pending_transitions.clone(),
         ));
-        let _ = self.set_consumer::<StopTaskOp, _>(StopTaskConsumer);
         #[cfg(feature = "tokio-local-task")]
-        let _ = self.set_consumer::<TaskOp<LocalTask>, _>(TokioLocalTaskConsumer::default());
+        {
+            self.set_consumer::<(StartTaskOp<LocalTask>, StopTaskOp), _>(
+                TokioLocalTaskConsumer::default(),
+            );
+        }
         #[cfg(feature = "tokio-mt-task")]
-        let _ = self.set_consumer::<TaskOp<SendTask>, _>(TokioMtTaskConsumer::default());
+        {
+            self.set_consumer::<(StartTaskOp<SendTask>, StopTaskOp), _>(
+                TokioMtTaskConsumer::default(),
+            );
+        }
     }
 
     pub fn new(
@@ -285,28 +290,48 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         self.context.borrow_mut()
     }
 
-    pub fn set_consumer<O, Cn>(&mut self, consumer: Cn) -> Option<Box<dyn OpConsumer>>
+    pub fn set_consumer<Ops, Cn>(&mut self, consumer: Cn)
     where
-        O: Operation + 'static,
+        Ops: ConsumerOpList,
         Cn: OpConsumer + 'static,
     {
-        self.consumers.insert(type_name::<O>(), Box::new(consumer))
+        let consumer: SharedConsumer = Rc::new(RefCell::new(consumer));
+        for key in Ops::keys() {
+            self.consumers
+                .entry(key)
+                .or_default()
+                .push(consumer.clone());
+        }
     }
 
-    pub fn with_consumer<O, Cn>(mut self, consumer: Cn) -> Self
+    pub fn with_consumer<Ops, Cn>(mut self, consumer: Cn) -> Self
     where
-        O: Operation + 'static,
+        Ops: ConsumerOpList,
         Cn: OpConsumer + 'static,
     {
-        let _ = self.set_consumer::<O, Cn>(consumer);
+        self.set_consumer::<Ops, Cn>(consumer);
         self
     }
 
-    pub fn remove_consumer<O>(&mut self) -> Option<Box<dyn OpConsumer>>
+    pub fn remove_consumer<Ops>(&mut self) -> Option<Vec<SharedConsumer>>
     where
-        O: Operation + 'static,
+        Ops: ConsumerOpList,
     {
-        self.consumers.remove(type_name::<O>())
+        self.remove_consumer_for_keys(Ops::keys())
+    }
+
+    fn remove_consumer_for_keys(&mut self, keys: Vec<&'static str>) -> Option<Vec<SharedConsumer>> {
+        let mut removed = Vec::new();
+        for key in keys {
+            if let Some(old) = self.consumers.remove(key) {
+                removed.extend(old);
+            }
+        }
+        if removed.is_empty() {
+            None
+        } else {
+            Some(removed)
+        }
     }
 
     pub fn clear_consumers(&mut self) {
@@ -327,7 +352,7 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
         let task: LocalTask = Box::new(move |_| {
             Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>
         });
-        self.machine.stage(TaskOp::Start { handle, task });
+        self.machine.stage(StartTaskOp { handle, task });
         handle
     }
 }
@@ -363,7 +388,7 @@ impl<E, Context: Clone + Send + 'static> SendTaskSpawner<E, Context> {
             Box::pin(build(envelope))
                 as core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
         });
-        self.machine.stage(TaskOp::Start { handle, task });
+        self.machine.stage(StartTaskOp { handle, task });
         handle
     }
 }
@@ -389,7 +414,7 @@ impl<E, Context: Clone + Send + 'static> SendEnvelope<E, Context> {
             Box::pin(build(envelope))
                 as core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
         });
-        self.machine.stage(TaskOp::Start { handle, task });
+        self.machine.stage(StartTaskOp { handle, task });
         handle
     }
 }
@@ -437,14 +462,25 @@ where
             while self.reconciler.borrow().has_pending() {
                 progressed = true;
                 self.reconciler.borrow_mut().commit(|ticket, mut op| {
-                    loop {
+                    'route: loop {
                         let key = op.operation_key();
 
-                        if let Some(consumer) = self.consumers.get_mut(key) {
-                            match consumer.as_mut().consume(ticket, op) {
-                                OpFlow::Consumed => return,
-                                OpFlow::Continue(next) => op = next,
+                        if let Some(consumers) = self.consumers.get(key) {
+                            for consumer in consumers {
+                                match consumer.borrow_mut().consume(ticket, op) {
+                                    OpFlow::Consumed => return,
+                                    OpFlow::Continue(next) => {
+                                        if next.operation_key() == key {
+                                            op = next;
+                                            continue;
+                                        }
+                                        op = next;
+                                        continue 'route;
+                                    }
+                                }
                             }
+                            on_unhandled(ticket, op);
+                            return;
                         } else {
                             on_unhandled(ticket, op);
                             return;
@@ -454,9 +490,20 @@ where
             }
 
             let mut drained_any = false;
-            for consumer in self.consumers.values_mut() {
-                if consumer.drain(&mut self.reconciler.borrow_mut()) {
-                    drained_any = true;
+            let mut drained_consumers = Vec::new();
+            for consumers in self.consumers.values() {
+                for consumer in consumers {
+                    let ptr = Rc::as_ptr(consumer) as *const ();
+                    if drained_consumers.contains(&ptr) {
+                        continue;
+                    }
+                    drained_consumers.push(ptr);
+                    if consumer
+                        .borrow_mut()
+                        .drain(&mut self.reconciler.borrow_mut())
+                    {
+                        drained_any = true;
+                    }
                 }
             }
 
@@ -796,7 +843,7 @@ mod tokio_local_tests {
                 machine.init(*idle);
                 assert_eq!(machine.current(), *idle);
 
-                // Go → working, on_enter stages TaskOp
+                // Go -> working, on_enter stages a start-task op.
                 machine.post(Ev::Go);
                 machine.advance();
                 assert_eq!(machine.current(), *working);
@@ -945,7 +992,7 @@ mod tokio_mt_tests {
         machine.init(*idle);
         assert_eq!(machine.current(), *idle);
 
-        // Go → working, on_enter stages TaskOp
+        // Go -> working, on_enter stages a start-task op.
         machine.post(Ev::Go);
         machine.advance();
         assert_eq!(machine.current(), *working);
