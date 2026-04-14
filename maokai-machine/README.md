@@ -118,7 +118,7 @@ Each consumer is responsible for one operation family. A consumer may:
 - drain externally-produced work back into the reconciler
 
 This design lets the machine remain generic while still supporting rich integrations. A task system, for example, is
-just another consumer that understands `TaskOp` and later re-injects `TaskCompletionOp`.
+just another consumer that understands `TaskOp` and later drains task-produced operations back into the reconciler.
 
 Because consumers are registered by operation type, the machine itself does not need to know the meaning of those
 operations ahead of time.
@@ -129,15 +129,15 @@ operations ahead of time.
 
 Task support in `maokai-machine` is intentionally indirect.
 
-The machine does not own a task runtime. Instead, a runtime-backed task consumer is registered for a specific `TaskOp`
-type. That consumer is responsible for starting work, stopping work, and draining task completions back into the
-operation pipeline.
+The machine still models task execution through consumers, but when a Tokio task feature is enabled it installs the
+matching runtime-backed task consumer by default in `Machine::new`. That consumer is responsible for starting work,
+stopping work, and draining task-produced operations back into the operation pipeline.
 
 This separation is important:
 
 - the machine remains runtime-agnostic
-- task runtimes stay attached to task consumers instead of leaking into the machine core
-- asynchronous completion becomes just another source of operations
+- task runtimes stay attached to task consumers instead of leaking into behavior code
+- asynchronous task output becomes just another source of operations
 
 As a result, local Tokio tasks, multi-threaded Tokio tasks, or custom runtimes can all fit the same machine model
 without changing the machine's own design.

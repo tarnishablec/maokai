@@ -12,7 +12,11 @@ use core::marker::PhantomData;
 use maokai_gears::ops::EventOp;
 use maokai_gears::ops::event::{EventOpConsumer, SharedEventQueue};
 #[cfg(any(feature = "tokio-local", feature = "tokio-mt"))]
-use maokai_gears::ops::task::TaskHandle;
+use maokai_gears::ops::task::{TaskHandle, TaskOp};
+#[cfg(feature = "tokio-local")]
+use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalTaskConsumer};
+#[cfg(feature = "tokio-mt")]
+use maokai_gears::runtime::tokio_mt::{SendTask, SendTaskMailboxSender, TokioMtTaskConsumer};
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
@@ -179,6 +183,18 @@ pub struct Machine<'a, 'b, T, E, Context> {
 }
 
 impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
+    fn install_default_consumers(&mut self) {
+        let _ = self
+            .set_consumer::<EventOp<E>, _>(EventOpConsumer::<E>::new(self.ready_events.clone()));
+        let _ = self.set_consumer::<RequestTransitionOp, _>(RequestTransitionConsumer::new(
+            self.pending_transitions.clone(),
+        ));
+        #[cfg(feature = "tokio-local")]
+        let _ = self.set_consumer::<TaskOp<LocalTask>, _>(TokioLocalTaskConsumer::default());
+        #[cfg(feature = "tokio-mt")]
+        let _ = self.set_consumer::<TaskOp<SendTask>, _>(TokioMtTaskConsumer::default());
+    }
+
     pub fn new(
         runner: &'a Runner<'a, T>,
         behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
@@ -186,18 +202,7 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
         let pending_transitions = Rc::new(RefCell::new(VecDeque::new()));
-        let mut consumers = BTreeMap::new();
-        consumers.insert(
-            type_name::<EventOp<E>>(),
-            Box::new(EventOpConsumer::<E>::new(ready_events.clone())) as Box<dyn OpConsumer>,
-        );
-        consumers.insert(
-            type_name::<RequestTransitionOp>(),
-            Box::new(RequestTransitionConsumer::new(pending_transitions.clone()))
-                as Box<dyn OpConsumer>,
-        );
-
-        Self {
+        let mut machine = Self {
             runner,
             behaviors,
             current: runner.tree.nil(),
@@ -205,8 +210,10 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             reconciler: Rc::new(RefCell::new(Reconciler::default())),
             ready_events,
             pending_transitions,
-            consumers,
-        }
+            consumers: BTreeMap::new(),
+        };
+        machine.install_default_consumers();
+        machine
     }
 
     pub fn current(&self) -> State {
@@ -254,66 +261,54 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
 
     pub fn clear_consumers(&mut self) {
         self.consumers = BTreeMap::new();
-        self.consumers.insert(
-            type_name::<EventOp<E>>(),
-            Box::new(EventOpConsumer::<E>::new(self.ready_events.clone())),
-        );
-        self.consumers.insert(
-            type_name::<RequestTransitionOp>(),
-            Box::new(RequestTransitionConsumer::new(
-                self.pending_transitions.clone(),
-            )),
-        );
+        self.install_default_consumers();
     }
 }
 
 #[cfg(feature = "tokio-local")]
 impl<E: 'static, Context: 'static> Envelope<E, Context> {
-    pub fn start_local_task<O: 'static, F, Fut>(&self, build: F) -> TaskHandle
+    pub fn start_local_task<F, Fut>(&self, build: F) -> TaskHandle
     where
         F: FnOnce(Self) -> Fut + 'static,
-        Fut: Future<Output = O> + 'static,
+        Fut: Future<Output = ()> + 'static,
     {
         let handle = TaskHandle::next();
         let envelop = self.clone();
-        let task: maokai_gears::runtime::tokio_local::LocalTask<O> = Box::new(
-            move |_: maokai_gears::runtime::tokio_local::LocalTaskEmitter<O>| {
-                Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = O> + 'static>>
-            },
-        );
+        let task: maokai_gears::runtime::tokio_local::LocalTask = Box::new(move |_| {
+            Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>
+        });
         self.machine
             .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
         handle
     }
 
-    pub fn stop_local_task<O: 'static>(&self, handle: TaskHandle) {
+    pub fn stop_local_task(&self, handle: TaskHandle) {
         self.machine.stage(maokai_gears::ops::task::TaskOp::<
-            maokai_gears::runtime::tokio_local::LocalTask<O>,
+            maokai_gears::runtime::tokio_local::LocalTask,
         >::Stop(handle));
     }
 }
 
 #[cfg(feature = "tokio-mt")]
-struct MpscOpSink<O>(maokai_gears::runtime::tokio_mt::SendTaskMailboxSender<O>);
+struct MpscOpSink(SendTaskMailboxSender);
 
 #[cfg(feature = "tokio-mt")]
-impl<O: Send + 'static> SendOpSink for MpscOpSink<O> {
+impl SendOpSink for MpscOpSink {
     fn send_op(&self, op: Box<dyn Operation + Send>) {
-        use maokai_gears::ops::task::TaskMailboxSender;
-        TaskMailboxSender::send_op(&self.0, op);
+        let _ = self.0.send(op);
     }
 }
 
 #[cfg(feature = "tokio-mt")]
 impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
-    pub fn start_send_task<O: Send + 'static, F, Fut>(&self, build: F) -> TaskHandle
+    pub fn start_send_task<F, Fut>(&self, build: F) -> TaskHandle
     where
         F: FnOnce(SendEnvelope<E, Context>) -> Fut + Send + 'static,
-        Fut: Future<Output = O> + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let handle = TaskHandle::next();
         let ctx = self.context.borrow().clone();
-        let task: maokai_gears::runtime::tokio_mt::SendTask<O> = Box::new(move |emitter| {
+        let task: maokai_gears::runtime::tokio_mt::SendTask = Box::new(move |emitter| {
             let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
             let envelope = SendEnvelope {
                 context: RefCell::new(ctx),
@@ -323,16 +318,16 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
                 },
             };
             Box::pin(build(envelope))
-                as core::pin::Pin<Box<dyn Future<Output = O> + Send + 'static>>
+                as core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
         });
         self.machine
             .stage(maokai_gears::ops::task::TaskOp::Start { handle, task });
         handle
     }
 
-    pub fn stop_send_task<O: Send + 'static>(&self, handle: TaskHandle) {
+    pub fn stop_send_task(&self, handle: TaskHandle) {
         self.machine.stage(maokai_gears::ops::task::TaskOp::<
-            maokai_gears::runtime::tokio_mt::SendTask<O>,
+            maokai_gears::runtime::tokio_mt::SendTask,
         >::Stop(handle));
     }
 }
@@ -645,10 +640,6 @@ mod tokio_local_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use maokai_gears::ops::task::{
-        TaskCompletion, TaskCompletionConsumer, TaskCompletionOp, TaskOp, TaskOpConsumer,
-    };
-    use maokai_gears::runtime::tokio_local::{LocalTask, TokioLocalRuntime};
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -700,7 +691,9 @@ mod tokio_local_tests {
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:working");
-            let _ = envo.start_local_task(|_envo| async move { "result" });
+            let _ = envo.start_local_task(|envo| async move {
+                envo.machine.post(Ev::TaskDone);
+            });
         }
         fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("exit:working");
@@ -732,23 +725,11 @@ mod tokio_local_tests {
         });
 
     #[tokio::test]
-    async fn task_spawns_on_enter_and_completion_feeds_back() {
+    async fn task_spawns_on_enter_and_posts_back() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
-                    .with_consumer::<TaskOp<LocalTask<&'static str>>, _>(TaskOpConsumer::<
-                        TokioLocalRuntime,
-                        LocalTask<&'static str>,
-                    >::new(
-                        TokioLocalRuntime
-                    ))
-                    .with_consumer::<TaskCompletionOp<&'static str>, _>(
-                        TaskCompletionConsumer::new(|completion: TaskCompletion<&'static str>| {
-                            assert_eq!(completion.output, "result");
-                            OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
-                        }),
-                    );
+                let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() });
                 let (_, idle, working) = &*TREE;
                 machine.init(*idle);
                 assert_eq!(machine.current(), *idle);
@@ -796,11 +777,6 @@ mod tokio_mt_tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use maokai_gears::ops::EventOp;
-    use maokai_gears::ops::task::{
-        TaskCompletion, TaskCompletionConsumer, TaskCompletionOp, TaskOp, TaskOpConsumer,
-    };
-    use maokai_gears::runtime::tokio_mt::{SendTask, TokioMtRuntime};
     use maokai_runner::{Behavior, EventReply, Transition};
     use maokai_tree::StateTree;
     use std::sync::LazyLock;
@@ -854,7 +830,6 @@ mod tokio_mt_tests {
             envo.context_mut().logs.push("enter:working");
             let _ = envo.start_send_task(|envo| async move {
                 envo.machine.post(Ev::TaskDone);
-                "result"
             });
         }
         fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
@@ -887,18 +862,8 @@ mod tokio_mt_tests {
         });
 
     #[tokio::test]
-    async fn task_spawns_on_enter_and_completion_feeds_back() {
-        let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() })
-            .with_consumer::<TaskOp<SendTask<&'static str>>, _>(TaskOpConsumer::<
-                TokioMtRuntime,
-                SendTask<&'static str>,
-            >::new(TokioMtRuntime))
-            .with_consumer::<TaskCompletionOp<&'static str>, _>(TaskCompletionConsumer::new(
-                |completion: TaskCompletion<&'static str>| {
-                    assert_eq!(completion.output, "result");
-                    OpFlow::Continue(Box::new(EventOp::Emit(Ev::TaskDone)))
-                },
-            ));
+    async fn task_spawns_on_enter_and_posts_back() {
+        let mut machine = Machine::new(&RUNNER, &BEHAVIORS, Context { logs: Vec::new() });
         let (_, idle, working) = &*TREE;
         machine.init(*idle);
         assert_eq!(machine.current(), *idle);

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["tokio-mt"]
 tokio-local = ["dep:tokio", "tokio/rt", "tokio/macros", "tokio/time", "maokai-gears/tokio-local"]
 tokio-mt = ["dep:tokio", "tokio/rt-multi-thread", "tokio/sync", "tokio/macros", "tokio/time", "maokai-gears/tokio-mt"]
 
