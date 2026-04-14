@@ -212,10 +212,14 @@ macro_rules! impl_consumer_ops_tuple {
     };
 }
 
+impl_consumer_ops_tuple!(A);
 impl_consumer_ops_tuple!(A, B);
 impl_consumer_ops_tuple!(A, B, C);
 impl_consumer_ops_tuple!(A, B, C, D);
-impl_consumer_ops_tuple!(A);
+impl_consumer_ops_tuple!(A, B, C, D, E);
+impl_consumer_ops_tuple!(A, B, C, D, E, F);
+impl_consumer_ops_tuple!(A, B, C, D, E, F, G);
+impl_consumer_ops_tuple!(A, B, C, D, E, F, G, H);
 
 type SharedConsumer = Rc<RefCell<dyn OpConsumer>>;
 
