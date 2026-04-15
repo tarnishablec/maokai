@@ -1140,9 +1140,10 @@ mod tokio_mt_tests {
             envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
+            let (_, _, working) = &*TREE;
             match event {
                 Ev::Go => {
-                    envo.machine.stage(RequestTransitionOp::new(TREE.2));
+                    envo.machine.stage(RequestTransitionOp::new(*working));
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -1172,14 +1173,15 @@ mod tokio_mt_tests {
             envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
+            let (_, idle, _) = &*TREE;
             match event {
                 Ev::Back => {
-                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    envo.machine.stage(RequestTransitionOp::new(*idle));
                     EventReply::Handled
                 }
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
-                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    envo.machine.stage(RequestTransitionOp::new(*idle));
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
