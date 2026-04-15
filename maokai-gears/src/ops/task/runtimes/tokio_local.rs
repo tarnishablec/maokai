@@ -4,7 +4,6 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
-use core::any::type_name;
 use core::cell::RefCell;
 use core::pin::Pin;
 use downcast::Downcast;
@@ -69,20 +68,15 @@ impl Default for TokioLocalTaskConsumer {
 
 impl OpConsumer for TokioLocalTaskConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match op.operation_key() {
-            key if key == type_name::<StartTaskOp<LocalTask>>() => {
-                match Downcast::<StartTaskOp<LocalTask>>::downcast(op) {
-                    Ok(task_op) => {
-                        let StartTaskOp { handle, task } = *task_op;
-                        let sender = self.runtime.sender.clone();
-                        let running = spawn_local(task(LocalTaskEmitter::new(sender)));
-                        self.runtime.running.insert(handle, running);
-                        OpFlow::Consumed
-                    }
-                    Err(err) => OpFlow::Continue(err.into_object()),
-                }
+        match Downcast::<StartTaskOp<LocalTask>>::downcast(op) {
+            Ok(task_op) => {
+                let StartTaskOp { handle, task } = *task_op;
+                let sender = self.runtime.sender.clone();
+                let running = spawn_local(task(LocalTaskEmitter::new(sender)));
+                self.runtime.running.insert(handle, running);
+                OpFlow::Consumed
             }
-            key if key == type_name::<StopTaskOp>() => match Downcast::<StopTaskOp>::downcast(op) {
+            Err(op) => match Downcast::<StopTaskOp>::downcast(op.into_object()) {
                 Ok(stop) => {
                     if let Some(running) = self.runtime.running.remove(&stop.0) {
                         running.abort();
@@ -101,7 +95,6 @@ impl OpConsumer for TokioLocalTaskConsumer {
                 }
                 Err(err) => OpFlow::Continue(err.into_object()),
             },
-            _ => OpFlow::Continue(op),
         }
     }
 

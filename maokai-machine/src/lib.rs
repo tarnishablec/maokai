@@ -7,9 +7,9 @@ use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::any::TypeId;
-use downcast::Downcast;
 use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
+use downcast::Downcast;
 use maokai_gears::ops::event::{EventOp, EventOpConsumer, SharedEventQueue};
 #[cfg(feature = "tokio-local-task")]
 use maokai_gears::ops::task::runtimes::tokio_local::{LocalTask, TokioLocalTaskConsumer};
@@ -173,7 +173,7 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
 }
 
 /// Priority for a transition request. Higher values win arbitration.
-/// Aligned with [`maokai_reconciler::Ticket`] priority (`u32`) so the same
+/// Aligned with [`Ticket`] priority (`u32`) so the same
 /// number can flow through both layers without conversion.
 pub type TransitionPriority = u32;
 
@@ -207,7 +207,7 @@ impl RequestTransitionOp {
 impl Operation for RequestTransitionOp {}
 
 /// Slot holding the rule-arbitrated transition request. Filled by
-/// `RequestTransitionConsumer` during commit and `take`n by the machine's
+/// `RequestTransitionConsumer` during commit and taken by the machine's
 /// advance loop each microstep.
 type PendingTransition = Shared<Option<RequestTransitionOp>>;
 
@@ -287,7 +287,7 @@ impl RequestTransitionConsumer {
 
 impl OpConsumer for RequestTransitionConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match downcast::Downcast::<RequestTransitionOp>::downcast(op) {
+        match Downcast::<RequestTransitionOp>::downcast(op) {
             // Arbitration already done by `RequestTransitionRule`; this is just transport.
             Ok(req) => {
                 *self.pending.borrow_mut() = Some(*req);
@@ -509,7 +509,11 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             }
         }
 
-        if removed.is_empty() { None } else { Some(removed) }
+        if removed.is_empty() {
+            None
+        } else {
+            Some(removed)
+        }
     }
 
     pub fn clear_consumers(&mut self) {

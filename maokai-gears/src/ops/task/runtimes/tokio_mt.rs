@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use core::any::type_name;
+use core::any::TypeId;
 use core::pin::Pin;
 use downcast::Downcast;
 use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
@@ -13,10 +13,8 @@ use crate::ops::task::*;
 
 type SendTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type SendTask = Box<dyn FnOnce(SendTaskEmitter) -> SendTaskFuture + Send + 'static>;
-pub type SendTaskMailboxSender =
-    mpsc::UnboundedSender<Box<dyn Operation + Send>>;
-pub type SendTaskMailboxSource =
-    mpsc::UnboundedReceiver<Box<dyn Operation + Send>>;
+pub type SendTaskMailboxSender = mpsc::UnboundedSender<Box<dyn Operation + Send>>;
+pub type SendTaskMailboxSource = mpsc::UnboundedReceiver<Box<dyn Operation + Send>>;
 
 pub struct SendTaskEmitter {
     sender: SendTaskMailboxSender,
@@ -68,30 +66,27 @@ impl Default for TokioMtTaskConsumer {
 
 impl OpConsumer for TokioMtTaskConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
-        match op.operation_key() {
-            key if key == type_name::<StartTaskOp<SendTask>>() => {
-                match Downcast::<StartTaskOp<SendTask>>::downcast(op) {
-                    Ok(task_op) => {
-                        let StartTaskOp { handle, task } = *task_op;
-                        let sender = self.runtime.sender.clone();
-                        let running = tokio::spawn(task(SendTaskEmitter::new(sender)));
-                        self.runtime.running.insert(handle, running);
-                        OpFlow::Consumed
-                    }
-                    Err(err) => OpFlow::Continue(err.into_object()),
-                }
-            }
-            key if key == type_name::<StopTaskOp>() => match Downcast::<StopTaskOp>::downcast(op) {
-                Ok(stop) => {
-                    if let Some(running) = self.runtime.running.remove(&stop.0) {
-                        running.abort();
-                    }
-                    OpFlow::Consumed
-                }
-                Err(err) => OpFlow::Continue(err.into_object()),
-            },
-            _ => OpFlow::Continue(op),
+        let type_id = (*op).type_id();
+
+        if type_id == TypeId::of::<StartTaskOp<SendTask>>() {
+            let task_op = Downcast::<StartTaskOp<SendTask>>::downcast(op)
+                .expect("type_id matched StartTaskOp<SendTask>");
+            let StartTaskOp { handle, task } = *task_op;
+            let sender = self.runtime.sender.clone();
+            let running = tokio::spawn(task(SendTaskEmitter::new(sender)));
+            self.runtime.running.insert(handle, running);
+            return OpFlow::Consumed;
         }
+
+        if type_id == TypeId::of::<StopTaskOp>() {
+            let stop = Downcast::<StopTaskOp>::downcast(op).expect("type_id matched StopTaskOp");
+            if let Some(running) = self.runtime.running.remove(&stop.0) {
+                running.abort();
+            }
+            return OpFlow::Consumed;
+        }
+
+        OpFlow::Continue(op)
     }
 
     fn drain(&mut self, reconciler: &mut Reconciler) -> bool {

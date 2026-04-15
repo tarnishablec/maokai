@@ -237,14 +237,8 @@ mod tests {
 
         let log = Log::default();
         let mut behaviors = Behaviors::default();
-        behaviors.register(
-            &off,
-            BlinkyBehavior { log: &log },
-        );
-        behaviors.register(
-            &on,
-            BlinkyBehavior { log: &log },
-        );
+        behaviors.register(&off, BlinkyBehavior { log: &log });
+        behaviors.register(&on, BlinkyBehavior { log: &log });
 
         let runner = Runner::new(&tree);
 
@@ -280,10 +274,7 @@ mod tests {
         let (tree, off, _) = build_tree();
         let log = Log::default();
         let mut behaviors = Behaviors::default();
-        behaviors.register(
-            &off,
-            BlinkyBehavior { log: &log },
-        );
+        behaviors.register(&off, BlinkyBehavior { log: &log });
 
         let runner = Runner::new(&tree);
         runner.transition(&behaviors, &off, &off, ());

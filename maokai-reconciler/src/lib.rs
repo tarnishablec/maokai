@@ -4,15 +4,11 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::any::{TypeId, type_name};
+use core::any::TypeId;
 use core::cmp::Ordering;
 use downcast::{Any, impl_downcast};
 
-pub trait Operation: Any {
-    fn operation_key(&self) -> &'static str {
-        type_name::<Self>()
-    }
-}
+pub trait Operation: Any {}
 
 impl_downcast!(dyn Operation);
 
