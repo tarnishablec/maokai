@@ -10,6 +10,9 @@ It is intentionally small in scope. The machine is not the source of state topol
 behavior, and not the home of runtime-specific task logic. Its job is to hold the current state of one live instance
 and to keep the system moving until it becomes stable.
 
+> `maokai-machine` is currently in a rapid iteration phase. Expect APIs to change frequently as the machine model,
+> consumer model, and ergonomics continue to evolve.
+
 ---
 
 ## Role
