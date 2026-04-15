@@ -5,7 +5,6 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::type_name;
 use core::cell::{Ref, RefCell, RefMut};
@@ -101,44 +100,46 @@ impl<E, Context> SendTaskSpawner<E, Context> {
     }
 }
 
-pub trait SendOpSink: Send + Sync + 'static {
-    fn send_op(&self, op: Box<dyn Operation + Send>);
-}
-
+#[cfg(feature = "tokio-mt-task")]
 pub struct SendMachineHandle<E> {
-    sink: Arc<dyn SendOpSink>,
+    sender: SendTaskMailboxSender,
     _marker: PhantomData<fn(E)>,
 }
 
+#[cfg(feature = "tokio-mt-task")]
 impl<E> Clone for SendMachineHandle<E> {
     fn clone(&self) -> Self {
         Self {
-            sink: self.sink.clone(),
+            sender: self.sender.clone(),
             _marker: PhantomData,
         }
     }
 }
 
+#[cfg(feature = "tokio-mt-task")]
 impl<E> SendMachineHandle<E> {
     pub fn stage<O>(&self, op: O)
     where
         O: Operation + Send + 'static,
     {
-        self.sink.send_op(Box::new(op));
+        let _ = self.sender.send(Box::new(op));
     }
 }
 
+#[cfg(feature = "tokio-mt-task")]
 impl<E: Send + 'static> SendMachineHandle<E> {
     pub fn post(&self, event: E) {
         self.stage(EventOp::Emit(event));
     }
 }
 
+#[cfg(feature = "tokio-mt-task")]
 pub struct SendEnvelope<E, Context> {
     context: RefCell<Context>,
     pub machine: SendMachineHandle<E>,
 }
 
+#[cfg(feature = "tokio-mt-task")]
 impl<E, Context: Clone> Clone for SendEnvelope<E, Context> {
     fn clone(&self) -> Self {
         Self {
@@ -148,6 +149,7 @@ impl<E, Context: Clone> Clone for SendEnvelope<E, Context> {
     }
 }
 
+#[cfg(feature = "tokio-mt-task")]
 impl<E, Context> SendEnvelope<E, Context> {
     pub fn context(&self) -> Ref<'_, Context> {
         self.context.borrow()
@@ -295,7 +297,7 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     pub fn new(
         runner: &'a Runner<'a, T>,
         behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
-        ctx: Context,
+        context: Context,
     ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
         let pending_transitions = Rc::new(RefCell::new(None));
@@ -303,7 +305,7 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             runner,
             behaviors,
             current: runner.tree.nil(),
-            context: Rc::new(RefCell::new(ctx)),
+            context: Rc::new(RefCell::new(context)),
             reconciler: Rc::new(RefCell::new(Reconciler::default())),
             ready_events,
             pending_transitions,
@@ -400,16 +402,6 @@ impl<E: 'static, Context: 'static> Envelope<E, Context> {
 }
 
 #[cfg(feature = "tokio-mt-task")]
-struct MpscOpSink(SendTaskMailboxSender);
-
-#[cfg(feature = "tokio-mt-task")]
-impl SendOpSink for MpscOpSink {
-    fn send_op(&self, op: Box<dyn Operation + Send>) {
-        let _ = self.0.send(op);
-    }
-}
-
-#[cfg(feature = "tokio-mt-task")]
 impl<E, Context: Clone + Send + 'static> SendTaskSpawner<E, Context> {
     pub fn start_task<F, Fut>(&self, build: F) -> TaskHandle
     where
@@ -419,11 +411,10 @@ impl<E, Context: Clone + Send + 'static> SendTaskSpawner<E, Context> {
         let handle = TaskHandle::next();
         let ctx = self.context.borrow().clone();
         let task: SendTask = Box::new(move |emitter| {
-            let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
             let envelope = SendEnvelope {
                 context: RefCell::new(ctx),
                 machine: SendMachineHandle {
-                    sink,
+                    sender: emitter.into_sender(),
                     _marker: PhantomData,
                 },
             };
@@ -445,11 +436,10 @@ impl<E, Context: Clone + Send + 'static> SendEnvelope<E, Context> {
         let handle = TaskHandle::next();
         let ctx = self.context.borrow().clone();
         let task: SendTask = Box::new(move |emitter| {
-            let sink: Arc<dyn SendOpSink> = Arc::new(MpscOpSink(emitter.into_sender()));
             let envelope = SendEnvelope {
                 context: RefCell::new(ctx),
                 machine: SendMachineHandle {
-                    sink,
+                    sender: emitter.into_sender(),
                     _marker: PhantomData,
                 },
             };
@@ -567,9 +557,9 @@ where
                 progressed = true;
                 // Dispatch runs `on_event` which can stage further ops (including
                 // `RequestTransitionOp`); those will be arbitrated next microstep.
-                let _ = self
-                    .runner
-                    .dispatch(self.behaviors, &self.current, &event, self.envelope());
+                let _ =
+                    self.runner
+                        .dispatch(self.behaviors, &self.current, &event, self.envelope());
             }
 
             if !progressed
@@ -902,7 +892,7 @@ mod tokio_local_tests {
                 machine.init(*idle);
                 assert_eq!(machine.current(), *idle);
 
-                // Go -> working, on_enter stages a start-task op.
+                // Go -> working, on_enter stages a `start-task` op.
                 machine.post(Ev::Go);
                 machine.advance();
                 assert_eq!(machine.current(), *working);
@@ -1058,7 +1048,7 @@ mod tokio_mt_tests {
         machine.init(*idle);
         assert_eq!(machine.current(), *idle);
 
-        // Go -> working, on_enter stages a start-task op.
+        // Go -> working, on_enter stages a `start-task` op.
         machine.post(Ev::Go);
         machine.advance();
         assert_eq!(machine.current(), *working);
