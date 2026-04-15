@@ -52,6 +52,17 @@ impl<E> MachineHandle<E> {
     {
         self.reconciler.borrow_mut().stage_boxed(Box::new(op), None)
     }
+
+    pub fn request_transition(
+        &self,
+        target: State,
+        priority: Option<TransitionPriority>,
+    ) -> Option<Ticket> {
+        match priority {
+            Some(priority) => self.stage(RequestTransitionOp::with_priority(target, priority)),
+            None => self.stage(RequestTransitionOp::new(target)),
+        }
+    }
 }
 
 impl<E: 'static> MachineHandle<E> {
@@ -128,6 +139,13 @@ impl<E> SendMachineHandle<E> {
         O: Operation + Send + 'static,
     {
         let _ = self.sender.send(Box::new(op));
+    }
+
+    pub fn request_transition(&self, target: State, priority: Option<TransitionPriority>) {
+        match priority {
+            Some(priority) => self.stage(RequestTransitionOp::with_priority(target, priority)),
+            None => self.stage(RequestTransitionOp::new(target)),
+        }
     }
 }
 
@@ -630,9 +648,7 @@ where
             return false;
         }
 
-        self.envelope()
-            .machine
-            .stage(RequestTransitionOp::new(target));
+        self.envelope().machine.request_transition(target, None);
         self.advance_with(on_unhandled);
         true
     }
@@ -792,7 +808,7 @@ mod tests {
             let (_, _, opened, _) = &*SETUP_TREE;
             match event {
                 LightEvent::Open => {
-                    envo.machine.stage(RequestTransitionOp::new(*opened));
+                    envo.machine.request_transition(*opened, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -818,11 +834,11 @@ mod tests {
 
             match event {
                 LightEvent::Close => {
-                    envo.machine.stage(RequestTransitionOp::new(*closed));
+                    envo.machine.request_transition(*closed, None);
                     EventReply::Handled
                 }
                 LightEvent::Shine => {
-                    envo.machine.stage(RequestTransitionOp::new(*shining));
+                    envo.machine.request_transition(*shining, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -999,7 +1015,7 @@ mod tokio_local_tests {
         ) -> EventReply {
             match event {
                 Ev::Go => {
-                    envo.machine.stage(RequestTransitionOp::new(TREE.2));
+                    envo.machine.request_transition(TREE.2, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -1027,7 +1043,7 @@ mod tokio_local_tests {
             match event {
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
-                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    envo.machine.request_transition(TREE.1, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -1143,7 +1159,7 @@ mod tokio_mt_tests {
             let (_, _, working) = &*TREE;
             match event {
                 Ev::Go => {
-                    envo.machine.stage(RequestTransitionOp::new(*working));
+                    envo.machine.request_transition(*working, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
@@ -1176,12 +1192,12 @@ mod tokio_mt_tests {
             let (_, idle, _) = &*TREE;
             match event {
                 Ev::Back => {
-                    envo.machine.stage(RequestTransitionOp::new(*idle));
+                    envo.machine.request_transition(*idle, None);
                     EventReply::Handled
                 }
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
-                    envo.machine.stage(RequestTransitionOp::new(*idle));
+                    envo.machine.request_transition(*idle, None);
                     EventReply::Handled
                 }
                 _ => EventReply::Ignored,
