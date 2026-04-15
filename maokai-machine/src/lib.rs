@@ -385,16 +385,39 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
 }
 
 #[cfg(feature = "tokio-local-task")]
+pub struct LocalTaskSpawner<E, Context> {
+    context: Shared<Context>,
+    machine: MachineHandle<E>,
+}
+
+#[cfg(feature = "tokio-local-task")]
+impl<E, Context> LocalTaskSpawner<E, Context> {
+    fn new(context: Shared<Context>, machine: MachineHandle<E>) -> Self {
+        Self { context, machine }
+    }
+}
+
+#[cfg(feature = "tokio-local-task")]
 impl<E: 'static, Context: 'static> Envelope<E, Context> {
+    pub fn local(&self) -> LocalTaskSpawner<E, Context> {
+        LocalTaskSpawner::new(self.context.clone(), self.machine.clone())
+    }
+}
+
+#[cfg(feature = "tokio-local-task")]
+impl<E: 'static, Context: 'static> LocalTaskSpawner<E, Context> {
     pub fn start_task<F, Fut>(&self, build: F) -> TaskHandle
     where
-        F: FnOnce(Self) -> Fut + 'static,
+        F: FnOnce(Envelope<E, Context>) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let handle = TaskHandle::next();
-        let envelop = self.clone();
+        let envelope = Envelope {
+            context: self.context.clone(),
+            machine: self.machine.clone(),
+        };
         let task: LocalTask = Box::new(move |_| {
-            Box::pin(build(envelop)) as core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>
+            Box::pin(build(envelope)) as core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>
         });
         self.machine.stage(StartTaskOp { handle, task });
         handle
@@ -848,7 +871,7 @@ mod tokio_local_tests {
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
         fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:working");
-            let _ = envo.start_task(|envo| async move {
+            let _ = envo.local().start_task(|envo| async move {
                 envo.machine.post(Ev::TaskDone);
             });
         }
