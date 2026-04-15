@@ -165,21 +165,50 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
     }
 }
 
+/// Priority for a transition request. Higher values win arbitration.
+/// Use the named constants in [`priority`] or any raw `i32` literal.
+pub type TransitionPriority = i32;
+
+pub mod priority {
+    use super::TransitionPriority;
+    pub const LOW: TransitionPriority = -100;
+    pub const NORMAL: TransitionPriority = 0;
+    pub const HIGH: TransitionPriority = 100;
+    pub const CRITICAL: TransitionPriority = 1000;
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct RequestTransitionOp {
     pub target: State,
+    pub priority: TransitionPriority,
+}
+
+impl RequestTransitionOp {
+    pub fn new(target: State) -> Self {
+        Self {
+            target,
+            priority: priority::NORMAL,
+        }
+    }
+
+    pub fn with_priority(target: State, priority: TransitionPriority) -> Self {
+        Self { target, priority }
+    }
 }
 
 impl Operation for RequestTransitionOp {}
 
-type SharedTransitionQueue = Shared<VecDeque<State>>;
+/// Slot holding the current arbitration winner. Filled by
+/// `RequestTransitionConsumer`; the machine's advance loop `take`s it each microstep.
+type PendingTransition = Shared<Option<RequestTransitionOp>>;
 
 pub struct RequestTransitionConsumer {
-    queue: SharedTransitionQueue,
+    pending: PendingTransition,
 }
 
 impl RequestTransitionConsumer {
-    pub fn new(queue: SharedTransitionQueue) -> Self {
-        Self { queue }
+    pub fn new(pending: PendingTransition) -> Self {
+        Self { pending }
     }
 }
 
@@ -187,7 +216,16 @@ impl OpConsumer for RequestTransitionConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
         match downcast::Downcast::<RequestTransitionOp>::downcast(op) {
             Ok(req) => {
-                self.queue.borrow_mut().push_back(req.target);
+                let mut slot = self.pending.borrow_mut();
+                // Incoming wins unless an equal-or-higher-priority request is
+                // already pending. Equal priorities → last-writer-wins.
+                let accept = match slot.as_ref() {
+                    Some(current) => req.priority >= current.priority,
+                    None => true,
+                };
+                if accept {
+                    *slot = Some(*req);
+                }
                 OpFlow::Consumed
             }
             Err(err) => OpFlow::Continue(err.into_object()),
@@ -230,7 +268,7 @@ pub struct Machine<'a, 'b, T, E, Context> {
     context: Shared<Context>,
     reconciler: Shared<Reconciler>,
     ready_events: SharedEventQueue<E>,
-    pending_transitions: SharedTransitionQueue,
+    pending_transitions: PendingTransition,
     consumers: BTreeMap<&'static str, Vec<SharedConsumer>>,
 }
 
@@ -260,7 +298,7 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         ctx: Context,
     ) -> Self {
         let ready_events = Rc::new(RefCell::new(VecDeque::new()));
-        let pending_transitions = Rc::new(RefCell::new(VecDeque::new()));
+        let pending_transitions = Rc::new(RefCell::new(None));
         let mut machine = Self {
             runner,
             behaviors,
@@ -442,7 +480,7 @@ where
 
         self.envelope()
             .machine
-            .stage(RequestTransitionOp { target });
+            .stage(RequestTransitionOp::new(target));
         self.advance_with(on_unhandled);
         true
     }
@@ -515,25 +553,29 @@ where
                 continue;
             }
 
-            while let Some(target) = self.pending_transitions.borrow_mut().pop_front() {
+            // Apply at most one arbitrated transition per microstep. Consumer already
+            // picked the winner; any losers were dropped at arbitration time.
+            if let Some(req) = self.pending_transitions.borrow_mut().take() {
                 progressed = true;
                 let envo = self.envelope();
-                self.current = self
-                    .runner
-                    .transition(self.behaviors, &self.current, &target, envo);
+                self.current =
+                    self.runner
+                        .transition(self.behaviors, &self.current, &req.target, envo);
             }
 
             while let Some(event) = self.ready_events.borrow_mut().pop_front() {
                 progressed = true;
-                self.current =
-                    self.runner
-                        .dispatch(self.behaviors, &self.current, &event, self.envelope());
+                // Dispatch runs `on_event` which can stage further ops (including
+                // `RequestTransitionOp`); those will be arbitrated next microstep.
+                let _ = self
+                    .runner
+                    .dispatch(self.behaviors, &self.current, &event, self.envelope());
             }
 
             if !progressed
                 && !self.reconciler.borrow().has_pending()
                 && self.ready_events.borrow().is_empty()
-                && self.pending_transitions.borrow().is_empty()
+                && self.pending_transitions.borrow().is_none()
             {
                 break;
             }
@@ -592,12 +634,15 @@ mod tests {
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: Envelope<LightEvent, Context>,
+            envo: Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, _, opened, _) = &*SETUP_TREE;
             match event {
-                LightEvent::Open => EventReply::Transition(*opened),
+                LightEvent::Open => {
+                    envo.machine.stage(RequestTransitionOp::new(*opened));
+                    EventReply::Handled
+                }
                 _ => EventReply::Ignored,
             }
         }
@@ -614,14 +659,20 @@ mod tests {
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: Envelope<LightEvent, Context>,
+            envo: Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, closed, _, shining) = &*SETUP_TREE;
 
             match event {
-                LightEvent::Close => EventReply::Transition(*closed),
-                LightEvent::Shine => EventReply::Transition(*shining),
+                LightEvent::Close => {
+                    envo.machine.stage(RequestTransitionOp::new(*closed));
+                    EventReply::Handled
+                }
+                LightEvent::Shine => {
+                    envo.machine.stage(RequestTransitionOp::new(*shining));
+                    EventReply::Handled
+                }
                 _ => EventReply::Ignored,
             }
         }
@@ -791,11 +842,14 @@ mod tokio_local_tests {
             &self,
             event: &Ev,
             _: &State,
-            _: Envelope<Ev, Context>,
+            envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
-                Ev::Go => EventReply::Transition(TREE.2),
+                Ev::Go => {
+                    envo.machine.stage(RequestTransitionOp::new(TREE.2));
+                    EventReply::Handled
+                }
                 _ => EventReply::Ignored,
             }
         }
@@ -821,7 +875,8 @@ mod tokio_local_tests {
             match event {
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
-                    EventReply::Transition(TREE.1)
+                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    EventReply::Handled
                 }
                 _ => EventReply::Ignored,
             }
@@ -930,11 +985,14 @@ mod tokio_mt_tests {
             &self,
             event: &Ev,
             _: &State,
-            _: Envelope<Ev, Context>,
+            envo: Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
-                Ev::Go => EventReply::Transition(TREE.2),
+                Ev::Go => {
+                    envo.machine.stage(RequestTransitionOp::new(TREE.2));
+                    EventReply::Handled
+                }
                 _ => EventReply::Ignored,
             }
         }
@@ -963,10 +1021,14 @@ mod tokio_mt_tests {
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
-                Ev::Back => EventReply::Transition(TREE.1),
+                Ev::Back => {
+                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    EventReply::Handled
+                }
                 Ev::TaskDone => {
                     envo.context.borrow_mut().logs.push("task:done");
-                    EventReply::Transition(TREE.1)
+                    envo.machine.stage(RequestTransitionOp::new(TREE.1));
+                    EventReply::Handled
                 }
                 _ => EventReply::Ignored,
             }

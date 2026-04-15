@@ -32,18 +32,17 @@ own `Behaviors`. No coordination required.
 
 ---
 
-## RTC dispatch
+## Dispatch and transition are separate
 
-Dispatch is `event-driven` and follows `Run-To-Completion` semantics. Each event is fully processed before the next can be dispatched. The entire exit and enter sequence completes before `dispatch` returns.
+`Runner::dispatch` bubbles an event through behaviors until one handles it. `Runner::transition` runs the exit/enter sequence between two states. The two are independent: routing an event does not change state, and changing state does not depend on any event.
 
-`dispatch` is not `re-entrant`. Calling `dispatch` from within `on_event`, `on_exit`, or `on_enter` is undefined behavior. This is a usage contract, not a type-level guarantee.
+Neither is `re-entrant`. Calling them from within `on_event`, `on_exit`, or `on_enter` is undefined behavior. This is a usage contract, not a type-level guarantee.
 
 ---
 
 ## Behavior declares intent
 
-`Behavior<E>` returns an `EventReply`: do nothing, bubble to parent, or transition to a target state. It does not
-execute the transition. The runner does.
+`Behavior<E>` returns an `EventReply`: handled (stop bubbling) or ignored (bubble to parent). It does not decide the next state. Deciding when and where to transition is the caller's responsibility — the runner only executes it.
 
 A behavior can be tested without a runner and written without knowing the tree's shape.
 
