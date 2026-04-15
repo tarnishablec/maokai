@@ -121,7 +121,7 @@ where
 {
     /// Dispatches an event starting from `current`, bubbling to the parent until a
     /// behavior handles it. Transitions are no longer triggered inline — behaviors
-    /// produce them as side effects (e.g. staging `RequestTransitionOp`).
+    /// produce them as side effects (e.g., staging `RequestTransitionOp`).
     pub fn dispatch<E, Context>(
         &self,
         behaviors: &Behaviors<E, Context>,

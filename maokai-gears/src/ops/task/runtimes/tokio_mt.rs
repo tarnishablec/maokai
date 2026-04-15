@@ -14,9 +14,9 @@ use crate::ops::task::*;
 type SendTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type SendTask = Box<dyn FnOnce(SendTaskEmitter) -> SendTaskFuture + Send + 'static>;
 pub type SendTaskMailboxSender =
-    mpsc::UnboundedSender<Box<dyn maokai_reconciler::Operation + Send>>;
+    mpsc::UnboundedSender<Box<dyn Operation + Send>>;
 pub type SendTaskMailboxSource =
-    mpsc::UnboundedReceiver<Box<dyn maokai_reconciler::Operation + Send>>;
+    mpsc::UnboundedReceiver<Box<dyn Operation + Send>>;
 
 pub struct SendTaskEmitter {
     sender: SendTaskMailboxSender,
@@ -116,7 +116,7 @@ mod tests {
 
     struct TestOp(i32);
 
-    impl maokai_reconciler::Operation for TestOp {}
+    impl Operation for TestOp {}
 
     #[tokio::test]
     async fn mt_task_emits_op() {
@@ -132,7 +132,7 @@ mod tests {
         join.await.unwrap();
 
         let op = receiver.try_recv().unwrap();
-        let op: Box<dyn maokai_reconciler::Operation> = op;
+        let op: Box<dyn Operation> = op;
         let value = Downcast::<TestOp>::downcast(op).unwrap();
         assert_eq!(value.0, 42);
         assert!(receiver.try_recv().is_err());

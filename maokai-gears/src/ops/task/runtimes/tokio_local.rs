@@ -15,7 +15,7 @@ use crate::ops::task::*;
 
 type LocalTaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 pub type LocalTask = Box<dyn FnOnce(LocalTaskEmitter) -> LocalTaskFuture + 'static>;
-type LocalTaskMailbox = Rc<RefCell<VecDeque<Box<dyn maokai_reconciler::Operation + Send>>>>;
+type LocalTaskMailbox = Rc<RefCell<VecDeque<Box<dyn Operation + Send>>>>;
 
 #[derive(Clone)]
 pub struct LocalTaskMailboxSender(LocalTaskMailbox);
@@ -127,7 +127,7 @@ mod tests {
 
     struct TestOp(i32);
 
-    impl maokai_reconciler::Operation for TestOp {}
+    impl Operation for TestOp {}
 
     #[tokio::test]
     async fn local_task_emits_op() {
@@ -146,7 +146,7 @@ mod tests {
                 join.await.unwrap();
 
                 let op = receiver.0.borrow_mut().pop_front().unwrap();
-                let op: Box<dyn maokai_reconciler::Operation> = op;
+                let op: Box<dyn Operation> = op;
                 let value = Downcast::<TestOp>::downcast(op).unwrap();
                 assert_eq!(value.0, 42);
                 assert!(receiver.0.borrow_mut().pop_front().is_none());
