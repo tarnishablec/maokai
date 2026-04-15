@@ -6,7 +6,8 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::any::type_name;
+use core::any::TypeId;
+use downcast::Downcast;
 use core::cell::{Ref, RefCell, RefMut};
 use core::marker::PhantomData;
 use maokai_gears::ops::event::{EventOp, EventOpConsumer, SharedEventQueue};
@@ -17,7 +18,10 @@ use maokai_gears::ops::task::runtimes::tokio_mt::{
     SendTask, SendTaskMailboxSender, TokioMtTaskConsumer,
 };
 use maokai_gears::ops::task::{StartTaskOp, StopTaskOp, TaskHandle};
-use maokai_reconciler::{OpConsumer, OpFlow, Operation, Reconciler, Ticket};
+use maokai_reconciler::{
+    IncomingDisposition, OpConsumer, OpFlow, Operation, PipelineFlow, Reconciler, Rule, RuleAccess,
+    RuleResult, Ticket,
+};
 use maokai_runner::{Behaviors, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
@@ -42,17 +46,17 @@ impl<E> MachineHandle<E> {
         }
     }
 
-    pub fn stage<O>(&self, op: O)
+    pub fn stage<O>(&self, op: O) -> Option<Ticket>
     where
         O: Operation + 'static,
     {
-        let _ = self.reconciler.borrow_mut().stage_boxed(Box::new(op), None);
+        self.reconciler.borrow_mut().stage_boxed(Box::new(op), None)
     }
 }
 
 impl<E: 'static> MachineHandle<E> {
-    pub fn post(&self, event: E) {
-        self.stage(EventOp::Emit(event));
+    pub fn post(&self, event: E) -> Option<Ticket> {
+        self.stage(EventOp::Emit(event))
     }
 }
 
@@ -169,14 +173,15 @@ impl<E, Context: Clone + Send + 'static> Envelope<E, Context> {
 }
 
 /// Priority for a transition request. Higher values win arbitration.
-/// Use the named constants in [`priority`] or any raw `i32` literal.
-pub type TransitionPriority = i32;
+/// Aligned with [`maokai_reconciler::Ticket`] priority (`u32`) so the same
+/// number can flow through both layers without conversion.
+pub type TransitionPriority = u32;
 
 pub mod priority {
     use super::TransitionPriority;
-    pub const LOW: TransitionPriority = -100;
-    pub const NORMAL: TransitionPriority = 0;
-    pub const HIGH: TransitionPriority = 100;
+    pub const LOW: TransitionPriority = 0;
+    pub const NORMAL: TransitionPriority = 100;
+    pub const HIGH: TransitionPriority = 200;
     pub const CRITICAL: TransitionPriority = 1000;
 }
 
@@ -201,9 +206,74 @@ impl RequestTransitionOp {
 
 impl Operation for RequestTransitionOp {}
 
-/// Slot holding the current arbitration winner. Filled by
-/// `RequestTransitionConsumer`; the machine's advance loop `take`s it each microstep.
+/// Slot holding the rule-arbitrated transition request. Filled by
+/// `RequestTransitionConsumer` during commit and `take`n by the machine's
+/// advance loop each microstep.
 type PendingTransition = Shared<Option<RequestTransitionOp>>;
+
+/// Decides which `RequestTransitionOp` survives when two are pending at the
+/// same time. Plug-in point for custom arbitration policies.
+pub trait TransitionArbiter: 'static {
+    /// Return `true` if `incoming` should replace `existing`.
+    fn prefer(&self, incoming: &RequestTransitionOp, existing: &RequestTransitionOp) -> bool;
+}
+
+/// Default arbiter: incoming wins when its priority is `>=` existing.
+/// Equal priorities → last-writer-wins.
+#[derive(Default)]
+pub struct PriorityArbiter;
+
+impl TransitionArbiter for PriorityArbiter {
+    fn prefer(&self, incoming: &RequestTransitionOp, existing: &RequestTransitionOp) -> bool {
+        incoming.priority >= existing.priority
+    }
+}
+
+/// Reconciler rule that keeps at most one `RequestTransitionOp` in the pending
+/// pool by consulting a [`TransitionArbiter`] at stage time.
+pub struct RequestTransitionRule {
+    arbiter: Box<dyn TransitionArbiter>,
+}
+
+impl RequestTransitionRule {
+    pub fn new<A: TransitionArbiter>(arbiter: A) -> Self {
+        Self {
+            arbiter: Box::new(arbiter),
+        }
+    }
+}
+
+impl Rule for RequestTransitionRule {
+    fn apply(
+        &self,
+        _incoming_ticket: Ticket,
+        incoming: &mut dyn Operation,
+        ctx: &mut dyn RuleAccess,
+    ) -> RuleResult {
+        let Ok(&incoming_req) = Downcast::<RequestTransitionOp>::downcast_ref(incoming) else {
+            return (PipelineFlow::Continue, IncomingDisposition::Keep);
+        };
+
+        // Invariant: this rule keeps at most one RequestTransitionOp in pending.
+        let existing = ctx.iter().find_map(|(t, op)| {
+            Downcast::<RequestTransitionOp>::downcast_ref(op)
+                .ok()
+                .map(|r| (t, *r))
+        });
+
+        match existing {
+            None => (PipelineFlow::Continue, IncomingDisposition::Keep),
+            Some((t, e)) => {
+                if self.arbiter.prefer(&incoming_req, &e) {
+                    ctx.unstage(t);
+                    (PipelineFlow::Continue, IncomingDisposition::Keep)
+                } else {
+                    (PipelineFlow::Break, IncomingDisposition::Drop)
+                }
+            }
+        }
+    }
+}
 
 pub struct RequestTransitionConsumer {
     pending: PendingTransition,
@@ -218,17 +288,9 @@ impl RequestTransitionConsumer {
 impl OpConsumer for RequestTransitionConsumer {
     fn consume(&mut self, _: Ticket, op: Box<dyn Operation>) -> OpFlow {
         match downcast::Downcast::<RequestTransitionOp>::downcast(op) {
+            // Arbitration already done by `RequestTransitionRule`; this is just transport.
             Ok(req) => {
-                let mut slot = self.pending.borrow_mut();
-                // Incoming wins unless an equal-or-higher-priority request is
-                // already pending. Equal priorities → last-writer-wins.
-                let accept = match slot.as_ref() {
-                    Some(current) => req.priority >= current.priority,
-                    None => true,
-                };
-                if accept {
-                    *slot = Some(*req);
-                }
+                *self.pending.borrow_mut() = Some(*req);
                 OpFlow::Consumed
             }
             Err(err) => OpFlow::Continue(err.into_object()),
@@ -237,7 +299,7 @@ impl OpConsumer for RequestTransitionConsumer {
 }
 
 pub trait ConsumerOpList {
-    fn keys() -> Vec<&'static str>;
+    fn type_ids() -> Vec<TypeId>;
 }
 
 macro_rules! impl_consumer_ops_tuple {
@@ -246,8 +308,8 @@ macro_rules! impl_consumer_ops_tuple {
         where
             $($name: Operation + 'static),+
         {
-            fn keys() -> Vec<&'static str> {
-                alloc::vec![$(type_name::<$name>()),+]
+            fn type_ids() -> Vec<TypeId> {
+                alloc::vec![$(TypeId::of::<$name>()),+]
             }
         }
     };
@@ -264,6 +326,46 @@ impl_consumer_ops_tuple!(A, B, C, D, E, F, G, H);
 
 type SharedConsumer = Rc<RefCell<dyn OpConsumer>>;
 
+#[derive(Default)]
+struct ConsumerStore {
+    slots: Vec<Option<SharedConsumer>>,
+    free: Vec<usize>,
+}
+
+impl ConsumerStore {
+    fn insert(&mut self, c: SharedConsumer) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.slots[idx] = Some(c);
+            idx
+        } else {
+            self.slots.push(Some(c));
+            self.slots.len() - 1
+        }
+    }
+
+    fn remove(&mut self, idx: usize) -> Option<SharedConsumer> {
+        let slot = self.slots.get_mut(idx)?;
+        let taken = slot.take();
+        if taken.is_some() {
+            self.free.push(idx);
+        }
+        taken
+    }
+
+    fn get(&self, idx: usize) -> Option<&SharedConsumer> {
+        self.slots.get(idx).and_then(|s| s.as_ref())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &SharedConsumer> {
+        self.slots.iter().filter_map(|s| s.as_ref())
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+    }
+}
+
 pub struct Machine<'a, 'b, T, E, Context> {
     runner: &'a Runner<'a, T>,
     behaviors: &'b Behaviors<'b, E, Envelope<E, Context>>,
@@ -272,10 +374,17 @@ pub struct Machine<'a, 'b, T, E, Context> {
     reconciler: Shared<Reconciler>,
     ready_events: SharedEventQueue<E>,
     pending_transitions: PendingTransition,
-    consumers: BTreeMap<&'static str, Vec<SharedConsumer>>,
+    consumers: ConsumerStore,
+    routes: BTreeMap<TypeId, Vec<usize>>,
 }
 
 impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
+    fn install_default_rules(&mut self) {
+        self.reconciler
+            .borrow_mut()
+            .add_rule(RequestTransitionRule::new(PriorityArbiter));
+    }
+
     fn install_default_consumers(&mut self) {
         self.set_consumer::<(EventOp<E>,), _>(EventOpConsumer::<E>::new(self.ready_events.clone()));
         self.set_consumer::<(RequestTransitionOp,), _>(RequestTransitionConsumer::new(
@@ -310,10 +419,20 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
             reconciler: Rc::new(RefCell::new(Reconciler::default())),
             ready_events,
             pending_transitions,
-            consumers: BTreeMap::new(),
+            consumers: ConsumerStore::default(),
+            routes: BTreeMap::new(),
         };
+        machine.install_default_rules();
         machine.install_default_consumers();
         machine
+    }
+
+    /// Replace the transition arbiter. Subsequent `RequestTransitionOp`s use the
+    /// new policy; any already-pending request is unaffected.
+    pub fn set_transition_arbiter<A: TransitionArbiter>(&mut self, arbiter: A) {
+        self.reconciler
+            .borrow_mut()
+            .add_rule(RequestTransitionRule::new(arbiter));
     }
 
     pub fn current(&self) -> State {
@@ -341,11 +460,9 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
         Cn: OpConsumer + 'static,
     {
         let consumer: SharedConsumer = Rc::new(RefCell::new(consumer));
-        for key in Ops::keys() {
-            self.consumers
-                .entry(key)
-                .or_default()
-                .push(consumer.clone());
+        let idx = self.consumers.insert(consumer);
+        for tid in Ops::type_ids() {
+            self.routes.entry(tid).or_default().push(idx);
         }
     }
 
@@ -362,25 +479,42 @@ impl<'a, 'b, T, E: 'static, Context> Machine<'a, 'b, T, E, Context> {
     where
         Ops: ConsumerOpList,
     {
-        self.remove_consumer_for_keys(Ops::keys())
-    }
+        use alloc::collections::BTreeSet;
 
-    fn remove_consumer_for_keys(&mut self, keys: Vec<&'static str>) -> Option<Vec<SharedConsumer>> {
-        let mut removed = Vec::new();
-        for key in keys {
-            if let Some(old) = self.consumers.remove(key) {
-                removed.extend(old);
+        let mut affected: BTreeSet<usize> = BTreeSet::new();
+        for tid in Ops::type_ids() {
+            if let Some(indices) = self.routes.remove(&tid) {
+                for idx in indices {
+                    affected.insert(idx);
+                }
             }
         }
-        if removed.is_empty() {
-            None
-        } else {
-            Some(removed)
+        if affected.is_empty() {
+            return None;
         }
+
+        // GC: only drop storage entries no longer referenced by any remaining route.
+        let still_referenced: BTreeSet<usize> = self
+            .routes
+            .values()
+            .flat_map(|v| v.iter().copied())
+            .collect();
+
+        let mut removed = Vec::new();
+        for idx in affected {
+            if !still_referenced.contains(&idx)
+                && let Some(c) = self.consumers.remove(idx)
+            {
+                removed.push(c);
+            }
+        }
+
+        if removed.is_empty() { None } else { Some(removed) }
     }
 
     pub fn clear_consumers(&mut self) {
-        self.consumers = BTreeMap::new();
+        self.consumers.clear();
+        self.routes.clear();
         self.install_default_consumers();
     }
 }
@@ -519,47 +653,47 @@ where
                 progressed = true;
                 self.reconciler.borrow_mut().commit(|ticket, mut op| {
                     'route: loop {
-                        let key = op.operation_key();
+                        let tid = (&*op as &dyn core::any::Any).type_id();
 
-                        if let Some(consumers) = self.consumers.get(key) {
-                            for consumer in consumers {
-                                match consumer.borrow_mut().consume(ticket, op) {
-                                    OpFlow::Consumed => return,
-                                    OpFlow::Continue(next) => {
-                                        if next.operation_key() == key {
-                                            op = next;
-                                            continue;
-                                        }
-                                        op = next;
+                        let Some(indices) = self.routes.get(&tid) else {
+                            on_unhandled(ticket, op);
+                            return;
+                        };
+
+                        let mut next_consumer = 0usize;
+                        loop {
+                            let Some(&idx) = indices.get(next_consumer) else {
+                                on_unhandled(ticket, op);
+                                return;
+                            };
+                            next_consumer += 1;
+
+                            let Some(consumer) = self.consumers.get(idx).cloned() else {
+                                continue;
+                            };
+
+                            match consumer.borrow_mut().consume(ticket, op) {
+                                OpFlow::Consumed => return,
+                                OpFlow::Continue(next) => {
+                                    let next_tid = (&*next as &dyn core::any::Any).type_id();
+                                    op = next;
+                                    if next_tid != tid {
                                         continue 'route;
                                     }
                                 }
                             }
-                            on_unhandled(ticket, op);
-                            return;
-                        } else {
-                            on_unhandled(ticket, op);
-                            return;
                         }
                     }
                 });
             }
 
             let mut drained_any = false;
-            let mut drained_consumers = Vec::new();
-            for consumers in self.consumers.values() {
-                for consumer in consumers {
-                    let ptr = Rc::as_ptr(consumer) as *const ();
-                    if drained_consumers.contains(&ptr) {
-                        continue;
-                    }
-                    drained_consumers.push(ptr);
-                    if consumer
-                        .borrow_mut()
-                        .drain(&mut self.reconciler.borrow_mut())
-                    {
-                        drained_any = true;
-                    }
+            for consumer in self.consumers.iter() {
+                if consumer
+                    .borrow_mut()
+                    .drain(&mut self.reconciler.borrow_mut())
+                {
+                    drained_any = true;
                 }
             }
 
