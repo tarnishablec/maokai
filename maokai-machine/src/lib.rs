@@ -22,7 +22,7 @@ use maokai_reconciler::{
     IncomingDisposition, OpConsumer, OpFlow, Operation, PipelineFlow, Reconciler, Rule, RuleAccess,
     RuleResult, Ticket,
 };
-use maokai_runner::{Behaviors, Runner};
+use maokai_runner::{Behaviors, EventReply, Runner};
 use maokai_tree::{State, StateTree, TreeView};
 
 type Shared<T> = Rc<RefCell<T>>;
@@ -735,9 +735,15 @@ where
                 progressed = true;
                 // Dispatch runs `on_event` which can stage further ops (including
                 // `RequestTransitionOp`); those will be arbitrated next microstep.
-                let _ =
+                // A returned `EventReply::Transition(target)` is the declarative
+                // equivalent: stage it at default priority so it flows through
+                // the same arbitration pipeline.
+                let reply =
                     self.runner
                         .dispatch(self.behaviors, &self.current, &event, self.envelope());
+                if let EventReply::Transition(target) = reply {
+                    self.envelope().machine.request_transition(target, None);
+                }
             }
 
             if !progressed

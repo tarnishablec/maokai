@@ -9,11 +9,20 @@ use maokai_tree::{State, StateTree, TreeView};
 // --- Core Runner Logic ---
 
 /// Defines the result of an event dispatch.
+///
+/// Used both as the per-behavior reply from `on_event` and as the aggregate
+/// outcome of `Runner::dispatch` (which returns the first non-`Ignored` reply
+/// produced along the bubble chain, or `Ignored` if nothing handled it).
 pub enum EventReply {
     /// Event was handled; do not bubble up.
     Handled,
     /// Did not handle the event; bubble it to the parent.
     Ignored,
+    /// Event was handled; do not bubble up, and request a transition to `target`.
+    /// The runner does not apply the transition itself — callers inspect the
+    /// dispatch result and either invoke `Runner::transition` (standalone use)
+    /// or stage a `RequestTransitionOp` (e.g. `maokai-machine` for arbitration).
+    Transition(State),
 }
 
 /// Describes a transition from one state to another.
@@ -119,9 +128,13 @@ impl<'a, T> Runner<'a, T>
 where
     StateTree<T>: TreeView,
 {
-    /// Dispatches an event starting from `current`, bubbling to the parent until a
-    /// behavior handles it. Transitions are no longer triggered inline — behaviors
-    /// produce them as side effects (e.g., staging `RequestTransitionOp`).
+    /// Dispatches an event starting from `current`, bubbling toward the root
+    /// until a behavior returns a non-`Ignored` reply. The winning reply is
+    /// returned verbatim; `Ignored` is returned only when no level handled it.
+    ///
+    /// `dispatch` never applies a `Transition(target)` inline — it only reports
+    /// intent. Callers decide how to act on it (execute via `transition`, or
+    /// stage for arbitration).
     pub fn dispatch<E, Context>(
         &self,
         behaviors: &Behaviors<E, Context>,
@@ -136,8 +149,8 @@ where
         loop {
             if let Some(behavior) = behaviors.map.get(&probe) {
                 match behavior.on_event(event, current, context.clone(), self.tree) {
-                    EventReply::Handled => return EventReply::Handled,
                     EventReply::Ignored => {}
+                    other => return other,
                 }
             }
             match self.tree.parent_of(&probe) {
@@ -310,6 +323,62 @@ mod tests {
                 enters: 0,
             }
         );
+    }
+
+    #[test]
+    fn dispatch_returns_transition_intent_without_applying() {
+        let (tree, off, on) = build_tree();
+        let log = Log::default();
+
+        struct RequestingBehavior {
+            target: State,
+        }
+        impl<Ctx> Behavior<Event, Ctx> for RequestingBehavior {
+            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+                EventReply::Transition(self.target)
+            }
+        }
+
+        let mut behaviors = Behaviors::default();
+        behaviors.register(&off, RequestingBehavior { target: on });
+        // Registered on the target to detect any accidental inline apply.
+        behaviors.register(&on, BlinkyBehavior { log: &log });
+
+        let runner = Runner::new(&tree);
+        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, ());
+
+        assert!(matches!(reply, EventReply::Transition(t) if t == on));
+        assert!(log.take().is_empty());
+    }
+
+    #[test]
+    fn dispatch_bubbles_past_ignored_to_transition_at_parent() {
+        let mut tree = StateTree::new("root");
+        let parent = tree.add_child(&tree.root(), "parent");
+        let leaf = tree.add_child(&parent, "leaf");
+
+        struct BubbleBehavior;
+        impl<Ctx> Behavior<Event, Ctx> for BubbleBehavior {
+            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+                EventReply::Ignored
+            }
+        }
+        struct RequestingBehavior {
+            target: State,
+        }
+        impl<Ctx> Behavior<Event, Ctx> for RequestingBehavior {
+            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+                EventReply::Transition(self.target)
+            }
+        }
+
+        let mut behaviors = Behaviors::default();
+        behaviors.register(&leaf, BubbleBehavior);
+        behaviors.register(&parent, RequestingBehavior { target: leaf });
+
+        let runner = Runner::new(&tree);
+        let reply = runner.dispatch(&behaviors, &leaf, &Event::Toggle, ());
+        assert!(matches!(reply, EventReply::Transition(t) if t == leaf));
     }
 
     #[test]
