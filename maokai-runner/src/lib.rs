@@ -39,17 +39,19 @@ pub struct Transition {
 // impl<T> Context for T {}
 
 /// Defines the life-cycle and event-handling logic for a specific state.
+///
+/// Context is borrowed exclusively. Behaviors that only need shared access
+/// can reborrow internally (`&*ctx`); handle-style contexts (e.g., an
+/// `Rc`-backed envelope) remain cheap to thread through because their own
+/// methods take `&self` and auto-reborrow from `&mut`.
 pub trait Behavior<E, Context = ()>: Send + Sync {
-    /// Called when the state machine enters this state.
-    fn on_enter(&self, _transition: &Transition, _context: Context) {}
-    /// Called when the state machine exits this state.
-    fn on_exit(&self, _transition: &Transition, _context: Context) {}
-    /// Processes an incoming event.
+    fn on_enter(&self, _transition: &Transition, _context: &mut Context) {}
+    fn on_exit(&self, _transition: &Transition, _context: &mut Context) {}
     fn on_event(
         &self,
         _event: &E,
         _current: &State,
-        _context: Context,
+        _context: &mut Context,
         _tree: &dyn TreeView,
     ) -> EventReply {
         EventReply::Handled
@@ -93,11 +95,8 @@ impl<'a, T> Runner<'a, T> {
         behaviors: &Behaviors<E, Context>,
         current: &State,
         target: &State,
-        context: Context,
-    ) -> State
-    where
-        Context: Clone,
-    {
+        context: &mut Context,
+    ) -> State {
         let (exit_list, enter_list) = self.tree.propose_transition(current, target);
         let transition = Transition {
             from: *current,
@@ -106,17 +105,15 @@ impl<'a, T> Runner<'a, T> {
             enter_list,
         };
 
-        // Notify states being exited (from leaf towards LCA)
         for state in &transition.exit_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                behavior.on_exit(&transition, context.clone());
+                behavior.on_exit(&transition, context);
             }
         }
 
-        // Notify states being entered (from LCA towards target leaf)
         for state in &transition.enter_list {
             if let Some(behavior) = behaviors.map.get(state) {
-                behavior.on_enter(&transition, context.clone());
+                behavior.on_enter(&transition, context);
             }
         }
 
@@ -140,15 +137,12 @@ where
         behaviors: &Behaviors<E, Context>,
         current: &State,
         event: &E,
-        context: Context,
-    ) -> EventReply
-    where
-        Context: Clone,
-    {
+        context: &mut Context,
+    ) -> EventReply {
         let mut probe = *current;
         loop {
             if let Some(behavior) = behaviors.map.get(&probe) {
-                match behavior.on_event(event, current, context.clone(), self.tree) {
+                match behavior.on_event(event, current, context, self.tree) {
                     EventReply::Ignored => {}
                     other => return other,
                 }
@@ -217,28 +211,40 @@ mod tests {
         (tree, off, on)
     }
 
-    impl<'a, Context> Behavior<Event, Context> for BlinkyBehavior<'a> {
-        fn on_enter(&self, transition: &Transition, _ctx: Context) {
+    impl<'a, Ctx> Behavior<Event, Ctx> for BlinkyBehavior<'a> {
+        fn on_enter(&self, transition: &Transition, _ctx: &mut Ctx) {
             self.log.push("enter", transition);
         }
-        fn on_exit(&self, transition: &Transition, _ctx: Context) {
+        fn on_exit(&self, transition: &Transition, _ctx: &mut Ctx) {
             self.log.push("exit", transition);
         }
-        fn on_event(&self, _e: &Event, _c: &State, _ctx: Context, _t: &dyn TreeView) -> EventReply {
+        fn on_event(
+            &self,
+            _e: &Event,
+            _c: &State,
+            _ctx: &mut Ctx,
+            _t: &dyn TreeView,
+        ) -> EventReply {
             EventReply::Handled
         }
     }
 
     impl Behavior<Event, Context> for CountingBehavior {
-        fn on_enter(&self, _transition: &Transition, ctx: Context) {
+        fn on_enter(&self, _transition: &Transition, ctx: &mut Context) {
             ctx.borrow_mut().enters += 1;
         }
 
-        fn on_exit(&self, _transition: &Transition, ctx: Context) {
+        fn on_exit(&self, _transition: &Transition, ctx: &mut Context) {
             ctx.borrow_mut().exits += 1;
         }
 
-        fn on_event(&self, _e: &Event, _c: &State, ctx: Context, _t: &dyn TreeView) -> EventReply {
+        fn on_event(
+            &self,
+            _e: &Event,
+            _c: &State,
+            ctx: &mut Context,
+            _t: &dyn TreeView,
+        ) -> EventReply {
             ctx.borrow_mut().events += 1;
             EventReply::Handled
         }
@@ -255,7 +261,7 @@ mod tests {
 
         let runner = Runner::new(&tree);
 
-        runner.transition(&behaviors, &off, &on, ());
+        runner.transition(&behaviors, &off, &on, &mut ());
         let results = log.take();
         let expected = Transition {
             from: off,
@@ -268,7 +274,7 @@ mod tests {
             [("exit", expected.clone()), ("enter", expected.clone())]
         );
 
-        runner.transition(&behaviors, &on, &off, ());
+        runner.transition(&behaviors, &on, &off, &mut ());
         let results = log.take();
         let expected = Transition {
             from: on,
@@ -290,7 +296,7 @@ mod tests {
         behaviors.register(&off, BlinkyBehavior { log: &log });
 
         let runner = Runner::new(&tree);
-        runner.transition(&behaviors, &off, &off, ());
+        runner.transition(&behaviors, &off, &off, &mut ());
 
         let results = log.take();
         let expected = Transition {
@@ -310,9 +316,9 @@ mod tests {
         behaviors.register(&off, CountingBehavior);
 
         let runner = Runner::new(&tree);
-        let ctx = Rc::new(RefCell::new(StateContext::default()));
+        let mut ctx = Rc::new(RefCell::new(StateContext::default()));
 
-        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, ctx.clone());
+        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, &mut ctx);
 
         assert!(matches!(reply, EventReply::Handled));
         assert_eq!(
@@ -334,18 +340,24 @@ mod tests {
             target: State,
         }
         impl<Ctx> Behavior<Event, Ctx> for RequestingBehavior {
-            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+            fn on_event(
+                &self,
+                _e: &Event,
+                _c: &State,
+                _ctx: &mut Ctx,
+                _t: &dyn TreeView,
+            ) -> EventReply {
                 EventReply::Transition(self.target)
             }
         }
 
         let mut behaviors = Behaviors::default();
         behaviors.register(&off, RequestingBehavior { target: on });
-        // Registered on the target to detect any accidental inline apply.
+        // Registered on the target to detect any accidental inline applied.
         behaviors.register(&on, BlinkyBehavior { log: &log });
 
         let runner = Runner::new(&tree);
-        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, ());
+        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, &mut ());
 
         assert!(matches!(reply, EventReply::Transition(t) if t == on));
         assert!(log.take().is_empty());
@@ -359,7 +371,13 @@ mod tests {
 
         struct BubbleBehavior;
         impl<Ctx> Behavior<Event, Ctx> for BubbleBehavior {
-            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+            fn on_event(
+                &self,
+                _e: &Event,
+                _c: &State,
+                _ctx: &mut Ctx,
+                _t: &dyn TreeView,
+            ) -> EventReply {
                 EventReply::Ignored
             }
         }
@@ -367,7 +385,13 @@ mod tests {
             target: State,
         }
         impl<Ctx> Behavior<Event, Ctx> for RequestingBehavior {
-            fn on_event(&self, _e: &Event, _c: &State, _ctx: Ctx, _t: &dyn TreeView) -> EventReply {
+            fn on_event(
+                &self,
+                _e: &Event,
+                _c: &State,
+                _ctx: &mut Ctx,
+                _t: &dyn TreeView,
+            ) -> EventReply {
                 EventReply::Transition(self.target)
             }
         }
@@ -377,7 +401,7 @@ mod tests {
         behaviors.register(&parent, RequestingBehavior { target: leaf });
 
         let runner = Runner::new(&tree);
-        let reply = runner.dispatch(&behaviors, &leaf, &Event::Toggle, ());
+        let reply = runner.dispatch(&behaviors, &leaf, &Event::Toggle, &mut ());
         assert!(matches!(reply, EventReply::Transition(t) if t == leaf));
     }
 
@@ -387,7 +411,67 @@ mod tests {
         let behaviors: Behaviors<Event> = Behaviors::default();
         let runner = Runner::new(&tree);
 
-        let reply = runner.dispatch(&behaviors, &tree.root(), &Event::Toggle, ());
+        let reply = runner.dispatch(&behaviors, &tree.root(), &Event::Toggle, &mut ());
         assert!(matches!(reply, EventReply::Ignored));
+    }
+
+    /// Exclusive context mutation — flat state, no interior mutability.
+    #[test]
+    fn exclusive_context_mutation() {
+        let (tree, off, on) = build_tree();
+
+        #[derive(Default, PartialEq, Eq, Debug)]
+        struct FlatState {
+            enters: usize,
+            exits: usize,
+            events: usize,
+        }
+
+        struct ExclusiveBehavior {
+            target: State,
+        }
+        impl Behavior<Event, FlatState> for ExclusiveBehavior {
+            fn on_enter(&self, _t: &Transition, ctx: &mut FlatState) {
+                ctx.enters += 1;
+            }
+            fn on_exit(&self, _t: &Transition, ctx: &mut FlatState) {
+                ctx.exits += 1;
+            }
+            fn on_event(
+                &self,
+                _e: &Event,
+                _c: &State,
+                ctx: &mut FlatState,
+                _tree: &dyn TreeView,
+            ) -> EventReply {
+                ctx.events += 1;
+                EventReply::Transition(self.target)
+            }
+        }
+
+        let mut behaviors = Behaviors::default();
+        behaviors.register(&off, ExclusiveBehavior { target: on });
+        behaviors.register(&on, ExclusiveBehavior { target: off });
+
+        let runner = Runner::new(&tree);
+        let mut state = FlatState::default();
+
+        let reply = runner.dispatch(&behaviors, &off, &Event::Toggle, &mut state);
+        assert!(matches!(reply, EventReply::Transition(t) if t == on));
+
+        let current = if let EventReply::Transition(target) = reply {
+            runner.transition(&behaviors, &off, &target, &mut state)
+        } else {
+            off
+        };
+        assert_eq!(current, on);
+        assert_eq!(
+            state,
+            FlatState {
+                enters: 1,
+                exits: 1,
+                events: 1
+            }
+        );
     }
 }

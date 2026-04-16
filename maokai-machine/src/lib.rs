@@ -725,10 +725,10 @@ where
             // picked the winner; any losers were dropped at arbitration time.
             if let Some(req) = self.pending_transitions.borrow_mut().take() {
                 progressed = true;
-                let envo = self.envelope();
+                let mut envo = self.envelope();
                 self.current =
                     self.runner
-                        .transition(self.behaviors, &self.current, &req.target, envo);
+                        .transition(self.behaviors, &self.current, &req.target, &mut envo);
             }
 
             while let Some(event) = self.ready_events.borrow_mut().pop_front() {
@@ -738,11 +738,12 @@ where
                 // A returned `EventReply::Transition(target)` is the declarative
                 // equivalent: stage it at default priority so it flows through
                 // the same arbitration pipeline.
+                let mut envo = self.envelope();
                 let reply =
                     self.runner
-                        .dispatch(self.behaviors, &self.current, &event, self.envelope());
+                        .dispatch(self.behaviors, &self.current, &event, &mut envo);
                 if let EventReply::Transition(target) = reply {
-                    self.envelope().machine.request_transition(target, None);
+                    envo.machine.request_transition(target, None);
                 }
             }
 
@@ -798,17 +799,17 @@ mod tests {
     struct ShiningBehavior;
 
     impl Behavior<LightEvent, Envelope<LightEvent, Context>> for ClosedBehavior {
-        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_enter(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("enter:closed");
         }
-        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_exit(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("exit:closed");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            envo: Envelope<LightEvent, Context>,
+            envo: &mut Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, _, opened, _) = &*SETUP_TREE;
@@ -823,17 +824,17 @@ mod tests {
     }
 
     impl Behavior<LightEvent, Envelope<LightEvent, Context>> for OpenedBehavior {
-        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_enter(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("enter:opened");
         }
-        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_exit(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("exit:opened");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            envo: Envelope<LightEvent, Context>,
+            envo: &mut Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             let (_, closed, _, shining) = &*SETUP_TREE;
@@ -853,17 +854,17 @@ mod tests {
     }
 
     impl Behavior<LightEvent, Envelope<LightEvent, Context>> for ShiningBehavior {
-        fn on_enter(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_enter(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("enter:shining");
         }
-        fn on_exit(&self, _t: &Transition, envo: Envelope<LightEvent, Context>) {
+        fn on_exit(&self, _t: &Transition, envo: &mut Envelope<LightEvent, Context>) {
             envo.context.borrow_mut().logs.push("exit:shining");
         }
         fn on_event(
             &self,
             event: &LightEvent,
             _current: &State,
-            _ctx: Envelope<LightEvent, Context>,
+            _ctx: &mut Envelope<LightEvent, Context>,
             _tree: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -1006,17 +1007,17 @@ mod tokio_local_tests {
     struct WorkingBehavior;
 
     impl Behavior<Ev, Envelope<Ev, Context>> for IdleBehavior {
-        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_enter(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:idle");
         }
-        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_exit(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("exit:idle");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            envo: Envelope<Ev, Context>,
+            envo: &mut Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -1030,20 +1031,20 @@ mod tokio_local_tests {
     }
 
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
-        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_enter(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:working");
             let _ = envo.local().start_task(|envo| async move {
                 envo.machine.post(Ev::TaskDone);
             });
         }
-        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_exit(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("exit:working");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            envo: Envelope<Ev, Context>,
+            envo: &mut Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             match event {
@@ -1149,17 +1150,17 @@ mod tokio_mt_tests {
     struct WorkingBehavior;
 
     impl Behavior<Ev, Envelope<Ev, Context>> for IdleBehavior {
-        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_enter(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("enter:idle");
         }
-        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_exit(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context.borrow_mut().logs.push("exit:idle");
         }
         fn on_event(
             &self,
             event: &Ev,
             _: &State,
-            envo: Envelope<Ev, Context>,
+            envo: &mut Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             let (_, _, working) = &*TREE;
@@ -1174,7 +1175,7 @@ mod tokio_mt_tests {
     }
 
     impl Behavior<Ev, Envelope<Ev, Context>> for WorkingBehavior {
-        fn on_enter(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_enter(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context_mut().logs.push("enter:working");
             let handle = envo.send().start_task(|envo| async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1182,7 +1183,7 @@ mod tokio_mt_tests {
             });
             envo.context_mut().running_task = Some(handle);
         }
-        fn on_exit(&self, _: &Transition, envo: Envelope<Ev, Context>) {
+        fn on_exit(&self, _: &Transition, envo: &mut Envelope<Ev, Context>) {
             envo.context_mut().logs.push("exit:working");
             if let Some(handle) = envo.context_mut().running_task.take() {
                 envo.stop_task(handle);
@@ -1192,7 +1193,7 @@ mod tokio_mt_tests {
             &self,
             event: &Ev,
             _: &State,
-            envo: Envelope<Ev, Context>,
+            envo: &mut Envelope<Ev, Context>,
             _: &dyn TreeView,
         ) -> EventReply {
             let (_, idle, _) = &*TREE;
