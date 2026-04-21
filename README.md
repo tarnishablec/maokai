@@ -34,7 +34,7 @@ own `Behaviors`. No coordination required.
 
 ## Dispatch and transition are separate
 
-`Runner::dispatch` bubbles an event through behaviors until one handles it. `Runner::transition` runs the exit/enter sequence between two states. The two are independent: routing an event does not change state, and changing state does not depend on any event.
+`Runner::dispatch` bubbles an event through behaviors until one handles it. `Runner::transition` runs the exit/enter sequence between two states. The two are independent: routing an event does not change the state, and changing state does not depend on any event.
 
 Neither is `re-entrant`. Calling them from within `on_event`, `on_exit`, or `on_enter` is undefined behavior. This is a usage contract, not a type-level guarantee.
 
@@ -42,7 +42,7 @@ Neither is `re-entrant`. Calling them from within `on_event`, `on_exit`, or `on_
 
 ## Behavior declares intent
 
-`Behavior<E>` returns an `EventReply`: handled (stop bubbling) or ignored (bubble to parent). It does not decide the next state. Deciding when and where to transition is the caller's responsibility — the runner only executes it.
+`Behavior<E>` returns an `EventReply`: `Handled` (stop bubbling), `Ignored` (bubble to parent), or `Transition(target)` (stop bubbling and declare transition intent). `Transition(target)` is intent only: `Runner::dispatch` reports it verbatim, and the caller decides whether to execute `Runner::transition` directly or stage it for arbitration.
 
 A behavior can be tested without a runner and written without knowing the tree's shape.
 
